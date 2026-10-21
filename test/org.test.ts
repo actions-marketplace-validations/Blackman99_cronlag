@@ -47,10 +47,12 @@ test("help mentions org", () => {
   assert.match(r.stdout, /--org <org>/);
 });
 
-test("--since remains unknown (later ROADMAP item)", () => {
-  const r = spawnSync(process.execPath, [CLI, "o/r", "--since", "24h"], { encoding: "utf8" });
-  assert.equal(r.status, 2);
-  assert.match(r.stderr, /unknown option --since/);
+test("org accepts --since and rejects it together with --days", () => {
+  const a = parseArgs(["org", "acme", "--since", "2026-09-01"]);
+  assert.deepEqual(a.flags.since, ["2026-09-01"]);
+  const r = spawnSync(process.execPath, [CLI, "org", "acme", "--since", "30d", "--days", "3"], { encoding: "utf8", env: { ...process.env, GITHUB_TOKEN: "x" } });
+  assert.equal(r.status, 2, r.stderr);
+  assert.match(r.stderr, /either --days or --since/);
 });
 
 function repo(partial: Partial<OrgRepoSummary> & Pick<OrgRepoSummary, "repo" | "verdict">): OrgRepoSummary {

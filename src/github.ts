@@ -37,7 +37,38 @@ export class GitHubError extends Error {
   }
 }
 
+/**
+ * Storage for settled days of workflow runs (one entry per repo + workflow + event + UTC day).
+ * Run creation times never change, so a UTC day that ended a while ago and whose runs are all
+ * completed will not gain or change runs: it is safe to keep. The Node CLI uses an on-disk cache
+ * (src/cache.ts); the browser bundle and the Action run without one.
+ */
+export interface RunCache {
+  get(key: string): Promise<Run[] | undefined>;
+  set(key: string, runs: Run[]): Promise<void>;
+  /** where it lives, for messages */
+  location?: string;
+}
+
+/** A day counts as settled (cacheable) this long after it ends: late-created scheduled runs and queued runs land first. */
+export const SETTLE_MS = 6 * 3_600_000;
+const DAY_MS = 86_400_000;
+/** The runs endpoint returns at most 1000 results for a filtered query. */
+const QUERY_CAP = 1000;
+
+export interface RunFetchStats {
+  /** API pages of runs fetched */
+  pages: number;
+  /** UTC days served from the cache */
+  cachedDays: number;
+  /** UTC days in the requested windows */
+  days: number;
+  /** a day had more runs than one query can return; some runs may be missing */
+  truncated: boolean;
+}
+
 export interface ClientOptions {
+  cache?: RunCache;
   token?: string;
   apiBase?: string;
   rawBase?: string;
@@ -51,7 +82,9 @@ export class GitHub {
   private raw: string;
   private f: typeof fetch;
   private ua?: string;
+  private cache?: RunCache;
   calls = 0;
+  runStats: RunFetchStats = { pages: 0, cachedDays: 0, days: 0, truncated: false };
 
   constructor(o: ClientOptions = {}) {
     this.token = o.token || undefined;
@@ -59,6 +92,19 @@ export class GitHub {
     this.raw = (o.rawBase ?? "https://raw.githubusercontent.com").replace(/\/$/, "");
     this.f = o.fetch ?? fetch.bind(globalThis);
     this.ua = o.userAgent;
+    this.cache = o.cache;
+  }
+
+  get cacheLocation(): string | undefined {
+    return this.cache?.location;
+  }
+
+  get apiHost(): string {
+    try {
+      return new URL(this.api).host;
+    } catch {
+      return "api";
+    }
   }
 
   get authenticated(): boolean {
@@ -157,6 +203,103 @@ export class GitHub {
     return out.sort((a, b) => a.created - b.created);
   }
 
+  /**
+   * All runs of one event created in [since, now], however long the window.
+   * The window is split into UTC days: settled days come from the cache when there is one,
+   * the rest is fetched as few contiguous `created=` range queries as possible (one for a
+   * fresh short window, same API cost as before), halved whenever a range exceeds the API's
+   * 1000-result cap. Days that are settled and fully completed are written back to the cache.
+   */
+  async runsWindow(full: string, workflowId: number, opts: { event: string; since: number; now?: number }): Promise<Run[]> {
+    const now = opts.now ?? Date.now();
+    const first = Math.floor(opts.since / DAY_MS) * DAY_MS;
+    const settled = (d: number) => d + DAY_MS <= now - SETTLE_MS;
+    const key = (d: number) => `${this.apiHost}/${full.toLowerCase()}/${workflowId}/${opts.event}/${new Date(d).toISOString().slice(0, 10)}`;
+    const out: Run[] = [];
+    const todo: number[] = [];
+    for (let d = first; d < now; d += DAY_MS) {
+      this.runStats.days++;
+      if (this.cache && settled(d)) {
+        const hit = await this.cache.get(key(d)).catch(() => undefined);
+        if (hit) {
+          this.runStats.cachedDays++;
+          out.push(...hit);
+          continue;
+        }
+      }
+      todo.push(d);
+    }
+    // Contiguous runs of uncached days → one range each; the range touching now stays open-ended.
+    const ranges: [number, number][] = [];
+    for (const d of todo) {
+      const last = ranges[ranges.length - 1];
+      if (last && last[1] === d) last[1] = d + DAY_MS;
+      else ranges.push([d, d + DAY_MS]);
+    }
+    for (const [a, b] of ranges) {
+      const { runs, complete } = await this.runsRange(full, workflowId, opts.event, a, Math.min(b, now), b >= now);
+      out.push(...runs);
+      if (!this.cache) continue;
+      for (let d = a; d < b; d += DAY_MS) {
+        if (!settled(d) || !complete.has(d)) continue;
+        const day = runs.filter((r) => r.created >= d && r.created < d + DAY_MS);
+        if (day.some((r) => r.status !== "completed")) continue;
+        await this.cache.set(key(d), day).catch(() => undefined);
+      }
+    }
+    const seen = new Set<number>();
+    return out
+      .filter((r) => r.created >= opts.since && r.created <= now && !seen.has(r.id) && (seen.add(r.id), true))
+      .sort((x, y) => x.created - y.created);
+  }
+
+  /** Runs created in [a, b) (b open-ended when `open`), splitting at day boundaries past the result cap. */
+  private async runsRange(full: string, workflowId: number, event: string, a: number, b: number, open: boolean): Promise<{ runs: Run[]; complete: Set<number> }> {
+    const iso = (t: number) => new Date(t).toISOString().replace(/\.\d{3}Z$/, "Z");
+    const created = open ? `>=${iso(a)}` : `${iso(a)}..${iso(b - 1000)}`;
+    const page = async (n: number) => {
+      const q = new URLSearchParams({ per_page: "100", page: String(n), created, event, exclude_pull_requests: "true" });
+      this.runStats.pages++;
+      return this.json<{ total_count: number; workflow_runs: Record<string, any>[] }>(`/repos/${full}/actions/workflows/${workflowId}/runs?${q}`);
+    };
+    const days = Math.max(1, Math.ceil((b - a) / DAY_MS));
+    const split = async (parts: number) => {
+      const bounds: number[] = [];
+      for (let i = 0; i < parts; i++) bounds.push(a + Math.floor((days * i) / parts) * DAY_MS);
+      bounds.push(b);
+      const pieces = await pool(
+        bounds.slice(0, -1).map((lo, i) => () => this.runsRange(full, workflowId, event, lo, bounds[i + 1], open && i === parts - 1)),
+        3,
+      );
+      return { runs: pieces.flatMap((p) => p.runs), complete: new Set(pieces.flatMap((p) => [...p.complete])) };
+    };
+    const p1 = await page(1);
+    const total = p1.total_count ?? p1.workflow_runs.length;
+    // Over the cap: split straight into pieces of ~800 runs instead of halving level by level.
+    if (total >= QUERY_CAP && days > 1) return split(Math.min(days, Math.ceil(total / 800)));
+    const runs = p1.workflow_runs.map(toRun);
+    const pages = Math.min(Math.ceil(total / 100), QUERY_CAP / 100);
+    const rest = await pool(
+      Array.from({ length: Math.max(0, pages - 1) }, (_, i) => () => page(i + 2)),
+      4,
+    );
+    for (const r of rest) runs.push(...r.workflow_runs.map(toRun));
+    // total_count can undercount: keep going while pages come back full.
+    let last = rest.length ? rest[rest.length - 1].workflow_runs.length : p1.workflow_runs.length;
+    for (let n = Math.max(pages, 1) + 1; last === 100 && n <= QUERY_CAP / 100; n++) {
+      const r = await page(n);
+      runs.push(...r.workflow_runs.map(toRun));
+      last = r.workflow_runs.length;
+    }
+    // total_count is only an estimate on big repos: a full 1000 results means the cap hit, whatever it said.
+    const capped = total >= QUERY_CAP || runs.length >= QUERY_CAP;
+    if (capped && days > 1) return split(2);
+    const complete = new Set<number>();
+    if (!capped) for (let d = a; d < b; d += DAY_MS) complete.add(d);
+    else this.runStats.truncated = true;
+    return { runs, complete };
+  }
+
   async run(full: string, runId: number): Promise<Run> {
     return toRun(await this.json<Record<string, any>>(`/repos/${full}/actions/runs/${runId}`));
   }
@@ -211,6 +354,20 @@ export interface OrgRepoListItem {
   defaultBranch: string;
   url: string;
   pushedAt: number;
+}
+
+/** Run async tasks with at most `n` in flight; results keep their order. */
+async function pool<T>(tasks: (() => Promise<T>)[], n: number): Promise<T[]> {
+  const out: T[] = new Array(tasks.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < tasks.length) {
+      const i = next++;
+      out[i] = await tasks[i]();
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(n, tasks.length) }, worker));
+  return out;
 }
 
 function toRun(x: Record<string, any>): Run {

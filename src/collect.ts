@@ -5,7 +5,10 @@ import { readTriggers, type ScheduleEntry } from "./workflow.js";
 const key = (s: ScheduleEntry[]) => s.map((x) => `${x.cron}@${x.timezone}`).sort().join("|");
 
 export interface CollectOptions {
+  /** window length in days (default 7); ignored when `from` is set */
   days?: number;
+  /** window start (ms), e.g. from `--since` */
+  from?: number;
   now?: number;
   /** match by file name, path, name or id */
   workflows?: string[];
@@ -22,8 +25,7 @@ export function matchesFilter(w: { id: number; name: string; path: string }, fil
 
 export async function collect(gh: GitHub, fullName: string, o: CollectOptions = {}): Promise<Snapshot> {
   const now = o.now ?? Date.now();
-  const days = o.days ?? 7;
-  const from = now - days * DAY;
+  const from = o.from ?? now - (o.days ?? 7) * DAY;
   const repo = await gh.repo(fullName);
   o.onProgress?.(`${repo.fullName}: listing workflows`);
   const all = (await gh.workflows(repo.fullName)).filter((w) => matchesFilter(w, o.workflows));
@@ -52,8 +54,8 @@ export async function collect(gh: GitHub, fullName: string, o: CollectOptions = 
     if (!trig.schedules.length && !/^\s*schedule\s*:/m.test(text)) continue;
     o.onProgress?.(`${w.path}: reading runs`);
     const [scheduleRuns, dispatchRuns, history] = await Promise.all([
-      gh.runs(repo.fullName, w.id, { event: "schedule", since: from - DAY }),
-      trig.hasDispatch ? gh.runs(repo.fullName, w.id, { event: "workflow_dispatch", since: from - DAY, maxPages: 1 }) : Promise.resolve([]),
+      gh.runsWindow(repo.fullName, w.id, { event: "schedule", since: from - DAY, now }),
+      trig.hasDispatch ? gh.runsWindow(repo.fullName, w.id, { event: "workflow_dispatch", since: from - DAY, now }) : Promise.resolve([]),
       o.lite ? Promise.resolve(null) : gh.fileHistory(repo.fullName, w.path, repo.defaultBranch).catch(() => null),
     ]);
     let timeline: WorkflowInput["timeline"];

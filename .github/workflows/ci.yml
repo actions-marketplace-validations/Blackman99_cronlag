@@ -56,6 +56,15 @@ jobs:
           for r in robhunter/agentdeals fpgas-online/fpgas.online-e2e-tests dongioia/chrlauncher-feed; do
             node dist/cli.js "$r" --days 7 --lite || exit 1
           done
+      - name: --since and the run cache (second run must agree with a cache-free one)
+        env:
+          CRONLAG_CACHE_DIR: ${{ runner.temp }}/cronlag-cache
+        run: |
+          node dist/cli.js robhunter/agentdeals --since 30d --lite -f json > a.json
+          node dist/cli.js robhunter/agentdeals --since 30d --lite -f json > b.json
+          node dist/cli.js robhunter/agentdeals --since 30d --lite -f json --no-cache > c.json
+          test -n "$(find "$CRONLAG_CACHE_DIR" -name '*.json' | head -1)"
+          node -e "const s=f=>{const r=require('./'+f);const cut=Date.parse(r.now)-2*864e5;return JSON.stringify(r.workflows.map(w=>[w.file,w.slots.filter(x=>x.at<cut).map(x=>x.status+(x.run?x.run.id:'')).join()]))}; if(s('a.json')!==s('b.json')||s('b.json')!==s('c.json')) throw new Error('cached and fresh reports differ'); console.log('cached == fresh for', require('./b.json').workflows.length, 'workflows')"
       - name: markdown into the job summary
         run: node dist/cli.js robhunter/agentdeals --days 14 -w reverify.yml --format markdown >> "$GITHUB_STEP_SUMMARY"
       - name: catch-up plan (dry run)
@@ -84,6 +93,11 @@ jobs:
       - run: |
           echo "verdict=${{ steps.lag.outputs.verdict }} missed=${{ steps.lag.outputs.missed }}"
           test -n "${{ steps.lag.outputs.verdict }}"
+      - id: since
+        uses: ./
+        with:
+          since: 36h
+      - run: test -n "${{ steps.since.outputs.verdict }}"
       - id: guard
         uses: ./
         with:

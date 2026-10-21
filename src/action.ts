@@ -4,6 +4,7 @@ import { analyze, fmtDur, MIN } from "./analyze.js";
 import { collect } from "./collect.js";
 import { formatMarkdown, formatText } from "./format.js";
 import { GitHub } from "./github.js";
+import { resolveWindow } from "./window.js";
 
 const input = (k: string, d = "") => (process.env[`INPUT_${k.replace(/ /g, "_").toUpperCase()}`] ?? d).trim() || d;
 const setOut = (k: string, v: string) => process.env.GITHUB_OUTPUT && appendFileSync(process.env.GITHUB_OUTPUT, `${k}=${v}\n`);
@@ -19,11 +20,13 @@ async function main() {
     return;
   }
   const repo = input("repo") || process.env.GITHUB_REPOSITORY || "";
-  const days = Number(input("days", "7"));
+  // `since` wins over `days` (days has a default, so "both set" can't be told apart from "since only").
+  const since = input("since");
+  const win = resolveWindow(since ? { since } : { days: input("days", "7") });
   const wf = input("workflow");
   const failOn = input("fail-on", "never");
   const gh = new GitHub({ token: token || undefined, userAgent: "cronlag-action" });
-  const snap = await collect(gh, repo, { days, workflows: wf ? wf.split(/[,\n]/).map((s) => s.trim()).filter(Boolean) : undefined });
+  const snap = await collect(gh, repo, { from: win.from, workflows: wf ? wf.split(/[,\n]/).map((s) => s.trim()).filter(Boolean) : undefined });
   const r = analyze(snap);
   console.log(formatText(r, { color: true, width: 110 }));
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, formatMarkdown(r) + "\n");

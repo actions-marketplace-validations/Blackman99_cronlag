@@ -6,6 +6,7 @@ import { CronError, minInterval, nextFires, parseCron } from "./cron.js";
 import { formatMarkdown } from "./format.js";
 import type { GitHub } from "./github.js";
 import { VERSION } from "./version.js";
+import { resolveWindow, WindowError } from "./window.js";
 
 const TOOLS = [
   {
@@ -16,7 +17,8 @@ const TOOLS = [
       type: "object",
       properties: {
         repo: { type: "string", description: "owner/repo" },
-        days: { type: "number", description: "window in days (default 7, max 90)" },
+        days: { type: "number", description: "window in days (default 7, max 400)" },
+        since: { type: "string", description: "window start instead of days: UTC date '2026-09-01', date-time '2026-09-01T06:00Z', or relative '36h' / '30d' / '6w'" },
         workflow: { type: "string", description: "optional: only this workflow (file name, path, name or id)" },
       },
       required: ["repo"],
@@ -73,8 +75,14 @@ export async function callTool(name: string, args: Json, gh: () => GitHub): Prom
   const repo = String(args.repo ?? "").replace(/^https?:\/\/github\.com\//, "").replace(/\/$/, "");
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return { text: "repo must be owner/repo", isError: true };
   if (name === "schedule_report") {
-    const days = Math.min(90, Math.max(1, Number(args.days ?? 7)));
-    const snap = await collect(gh(), repo, { days, workflows: args.workflow ? [String(args.workflow)] : undefined });
+    let from: number;
+    try {
+      from = resolveWindow({ days: args.days ?? undefined, since: args.since ? String(args.since) : undefined }).from;
+    } catch (e) {
+      if (e instanceof WindowError) return { text: e.message.replace(/--(days|since)/g, "$1"), isError: true };
+      throw e;
+    }
+    const snap = await collect(gh(), repo, { from, workflows: args.workflow ? [String(args.workflow)] : undefined });
     const r = analyze(snap);
     const compact = {
       repo: r.repo,

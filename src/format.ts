@@ -1,5 +1,6 @@
 import { fmtDur, HOUR, type Report, type Slot, type WorkflowReport, type CatchupStep } from "./analyze.js";
 import type { OrgReport } from "./org.js";
+import { windowLabel } from "./window.js";
 
 export interface TextOptions {
   color: boolean;
@@ -39,6 +40,41 @@ export function slotGlyph(s: Slot): { ch: string; tone: "green" | "yellow" | "re
   }
 }
 
+const SEVERITY: Record<string, number> = { pending: 0, ontime: 1, late: 2, verylate: 3, overdue: 4, missed: 5 };
+
+/** A strip mark: one slot, or (in a folded strip) the worst of several, flagged when only some of them missed. */
+export interface StripMark {
+  slot: Slot;
+  /** folded mark whose slots were partly missed and partly ran */
+  someMissed?: boolean;
+}
+
+/**
+ * Long windows would print pages of glyphs; past `max` slots, each mark stands for `per`
+ * consecutive slots. A mark is ✕ only when every slot in it missed; when some ran and some
+ * didn't it is a small x, so a thinned-out schedule doesn't read as "nothing ran". Otherwise it
+ * shows the worst lag.
+ */
+export function compactSlots(slots: Slot[], max: number): { marks: StripMark[]; per: number } {
+  if (slots.length <= max) return { marks: slots.map((slot) => ({ slot })), per: 1 };
+  const per = Math.ceil(slots.length / max);
+  const marks: StripMark[] = [];
+  for (let i = 0; i < slots.length; i += per) {
+    const group = slots.slice(i, i + per);
+    const worst = group.reduce((w, s) => {
+      const d = SEVERITY[s.status] - SEVERITY[w.status];
+      return d > 0 || (d === 0 && (s.lagMs ?? 0) > (w.lagMs ?? 0)) ? s : w;
+    });
+    const missed = group.filter((s) => s.status === "missed").length;
+    marks.push(missed && missed < group.length && group.some((s) => s.run) ? { slot: worst, someMissed: true } : { slot: worst });
+  }
+  return { marks, per };
+}
+
+export function markGlyph(m: StripMark): ReturnType<typeof slotGlyph> {
+  return m.someMissed ? { ch: "x", tone: "magenta" } : slotGlyph(m.slot);
+}
+
 export function wrap(text: string, width: number): string[] {
   const out: string[] = [];
   let cur = "";
@@ -58,26 +94,29 @@ export function formatText(r: Report, o: TextOptions): string {
   const c = (k: keyof typeof C, s: string) => (o.color ? C[k] + s + C.reset : s);
   const width = Math.max(40, Math.min(o.width ?? 100, 120));
   const lines: string[] = [];
-  lines.push(`${c("bold", "cronlag")}  ${r.repo}  ${c("dim", `· last ${r.days} days · times UTC`)}`);
+  lines.push(`${c("bold", "cronlag")}  ${r.repo}  ${c("dim", `· ${windowLabel(r.from, r.now)} · times UTC`)}`);
   if (!r.workflows.length) {
     lines.push("");
     lines.push(`No scheduled workflows found${r.unscheduled.length ? ` (${r.unscheduled.length} workflows without \`on: schedule\`)` : ""}.`);
     return lines.join("\n");
   }
+  const perLine = Math.max(20, width - 4);
+  let folded = false;
   for (const w of r.workflows) {
     lines.push("");
     const crons = w.crons.map((x) => `${x.cron}${x.timezone !== "UTC" ? ` (${x.timezone})` : ""}`).join("  |  ");
     lines.push(`${c("bold", w.file)}  ${c("dim", `"${w.name}"`)}  ${c("cyan", crons)}`);
     for (const ch of w.changes) lines.push(`  ${c("dim", `schedule changed ${ch.at.slice(0, 16).replace("T", " ")} → ${ch.crons.join(", ") || "(none)"}; earlier slots use the old cron`)}`);
-    // strip
-    const perLine = Math.max(20, width - 4);
-    for (let i = 0; i < w.slots.length; i += perLine) {
-      const chunk = w.slots.slice(i, i + perLine);
-      lines.push("  " + chunk.map((s) => { const g = slotGlyph(s); return c(g.tone, g.ch); }).join(""));
+    // strip: at most 3 lines; longer windows fold several slots into one glyph
+    const strip = compactSlots(w.slots, perLine * 3);
+    if (strip.per > 1) folded = true;
+    for (let i = 0; i < strip.marks.length; i += perLine) {
+      const chunk = strip.marks.slice(i, i + perLine);
+      lines.push("  " + chunk.map((m) => { const g = markGlyph(m); return c(g.tone, g.ch); }).join(""));
     }
     const s = w.stats;
     if (w.slots.length) {
-      lines.push(`  ${s.due} slots · ${s.ran} ran · ${s.missed ? c("magenta", `${s.missed} missed`) : "0 missed"}${s.overdue ? ` · ${c("magenta", `${s.overdue} overdue`)}` : ""}${s.ran ? `   on time ${s.onTime}/${s.ran} · within 1h ${s.within1h}/${s.ran}` : ""}`);
+      lines.push(`  ${s.due} slots${strip.per > 1 ? c("dim", ` (1 mark = worst of ${strip.per})`) : ""} · ${s.ran} ran · ${s.missed ? c("magenta", `${s.missed} missed`) : "0 missed"}${s.overdue ? ` · ${c("magenta", `${s.overdue} overdue`)}` : ""}${s.ran ? `   on time ${s.onTime}/${s.ran} · within 1h ${s.within1h}/${s.ran}` : ""}`);
       if (s.ran) lines.push(`  lag  min ${fmtDur(s.lagMin)} · median ${c("bold", fmtDur(s.lagMedian))} · p90 ${fmtDur(s.lagP90)} · max ${fmtDur(s.lagMax)}${s.queueMedian !== null && s.queueMedian > 60_000 ? `   queue ${fmtDur(s.queueMedian)}` : ""}`);
     }
     const tone = (TONE[w.verdict] ?? "gray") as keyof typeof C;
@@ -93,17 +132,18 @@ export function formatText(r: Report, o: TextOptions): string {
     lines.push(c("dim", `${r.unscheduled.length} other workflow${r.unscheduled.length === 1 ? "" : "s"} without a schedule: ${r.unscheduled.slice(0, 8).join(", ")}${r.unscheduled.length > 8 ? ", …" : ""}`));
   }
   lines.push("");
-  lines.push(c("dim", "bar = lag  ▁≤2m ▂≤10m ▃≤30m ▄≤1h ▅≤3h ▆≤6h ▇≤12h █>12h   ✕ no run   ? not yet"));
+  lines.push(c("dim", `bar = lag  ▁≤2m ▂≤10m ▃≤30m ▄≤1h ▅≤3h ▆≤6h ▇≤12h █>12h   ✕ no run${folded ? "   x some missed" : ""}   ? not yet`));
   return lines.join("\n");
 }
 
 function mdSlotRow(w: WorkflowReport): string {
-  return w.slots.map((s) => slotGlyph(s).ch).join("");
+  const strip = compactSlots(w.slots, 240);
+  return "`" + strip.marks.map((m) => markGlyph(m).ch).join("") + "`" + (strip.per > 1 ? ` <sub>each mark = ${strip.per} slots: ✕ none ran, x some missed, else the worst lag</sub>` : "");
 }
 
 export function formatMarkdown(r: Report): string {
   const out: string[] = [];
-  out.push(`### cronlag — ${r.repo} (last ${r.days} days, UTC)`);
+  out.push(`### cronlag — ${r.repo} · ${windowLabel(r.from, r.now)} · UTC`);
   out.push("");
   if (!r.workflows.length) {
     out.push("No scheduled workflows found.");
@@ -120,7 +160,7 @@ export function formatMarkdown(r: Report): string {
   for (const w of r.workflows) {
     out.push("");
     out.push(`**${w.file}** — ${w.verdict}: ${w.headline}`);
-    if (w.slots.length) out.push("", "`" + mdSlotRow(w) + "`");
+    if (w.slots.length) out.push("", mdSlotRow(w));
     for (const f of w.findings) out.push(`- ${f.level === "error" ? "✗" : f.level === "warn" ? "⚠️" : "·"} ${f.message}${f.fix ? ` → ${f.fix.includes("`") ? f.fix : "`" + f.fix + "`"}` : ""}`);
     const late = w.slots.filter((s) => s.status !== "ontime" && s.status !== "pending").slice(-8);
     if (late.length) {
@@ -155,7 +195,7 @@ export function formatOrgText(r: OrgReport, o: TextOptions): string {
   const c = (k: keyof typeof C, s: string) => (o.color ? C[k] + s + C.reset : s);
   const lines: string[] = [];
   lines.push(
-    `${c("bold", "cronlag")}  org/${r.org}  ${c("dim", `· last ${r.days} days · ${r.withSchedules} of ${r.scanned} repos have schedules${r.skippedArchived ? ` · ${r.skippedArchived} archived skipped` : ""} · times UTC`)}`,
+    `${c("bold", "cronlag")}  org/${r.org}  ${c("dim", `· ${windowLabel(r.from, r.now)} · ${r.withSchedules} of ${r.scanned} repos have schedules${r.skippedArchived ? ` · ${r.skippedArchived} archived skipped` : ""} · times UTC`)}`,
   );
   if (!r.repos.length) {
     lines.push("");
@@ -192,7 +232,7 @@ export function formatOrgText(r: OrgReport, o: TextOptions): string {
 
 export function formatOrgMarkdown(r: OrgReport): string {
   const out: string[] = [];
-  out.push(`### cronlag — org/${r.org} (last ${r.days} days, UTC)`);
+  out.push(`### cronlag — org/${r.org} · ${windowLabel(r.from, r.now)} · UTC`);
   out.push("");
   out.push(`${r.withSchedules} of ${r.scanned} repos have schedules${r.skippedArchived ? `; ${r.skippedArchived} archived skipped` : ""}.`);
   out.push("");

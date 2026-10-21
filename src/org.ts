@@ -1,5 +1,6 @@
 import { analyze, DAY, VERDICT_RANK, type Report, type Thresholds } from "./analyze.js";
 import { collect } from "./collect.js";
+import { MAX_WINDOW_DAYS } from "./window.js";
 import { GitHub, GitHubError, type OrgRepoListItem } from "./github.js";
 
 export interface OrgWorkflowSummary {
@@ -45,6 +46,8 @@ export interface OrgReport {
 
 export interface ScanOrgOptions {
   days?: number;
+  /** window start (ms), e.g. from `--since`; overrides days */
+  from?: number;
   now?: number;
   workflows?: string[];
   thresholds?: Thresholds;
@@ -100,9 +103,9 @@ async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T, inde
 
 /** Scan every non-archived repo in an org that has `on: schedule` workflows. Worst first. */
 export async function scanOrg(gh: GitHub, org: string, o: ScanOrgOptions = {}): Promise<OrgReport> {
-  const days = Math.min(90, Math.max(1, o.days ?? 7));
   const now = o.now ?? Date.now();
-  const from = now - days * DAY;
+  const from = o.from ?? now - Math.min(MAX_WINDOW_DAYS, Math.max(1 / 24, o.days ?? 7)) * DAY;
+  const days = Math.round((now - from) / DAY);
   const skipArchived = o.skipArchived !== false;
   const concurrency = o.concurrency ?? 2;
 
@@ -120,7 +123,7 @@ export async function scanOrg(gh: GitHub, org: string, o: ScanOrgOptions = {}): 
     o.onProgress?.(`scanning ${i + 1}/${targets.length} ${repo.fullName}`);
     try {
       const snap = await collect(gh, repo.fullName, {
-        days,
+        from,
         now,
         workflows: o.workflows,
         lite: true,

@@ -1,6 +1,6 @@
 {
   "name": "cronlag",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Is your scheduled GitHub Actions workflow late, dropped, or broken \u2014 and is it you or GitHub? Slot-by-slot lag report, cause checks, and missed-slot catch-up.",
   "type": "module",
   "bin": {
@@ -24,7 +24,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test test/cron.test.ts test/workflow.test.ts test/analyze.test.ts test/cli.test.ts test/org.test.ts",
+    "test": "node --import tsx --test test/cron.test.ts test/workflow.test.ts test/analyze.test.ts test/cli.test.ts test/org.test.ts test/window.test.ts",
     "docs": "node scripts/build_docs.mjs && node scripts/build_blog.mjs"
   },
   "keywords": [

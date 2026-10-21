@@ -10,7 +10,9 @@
 <main class="doc"><h1>Configuration</h1>
 <h2>CLI flags</h2>
 <table><tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
-<tr><td><code>-d, --days</code></td><td>7</td><td>window to inspect (1–90)</td></tr>
+<tr><td><code>-d, --days</code></td><td>7</td><td>window to inspect, up to 400 days (fractions work: <code>0.5</code>)</td></tr>
+<tr><td><code>-s, --since</code></td><td></td><td>window start instead of <code>--days</code>: <code>2026-09-01</code>, <code>2026-09-01T06:00Z</code> (UTC unless an offset is given) or relative <code>36h</code> / <code>30d</code> / <code>6w</code>; at least 1h, at most 400 days</td></tr>
+<tr><td><code>--no-cache</code></td><td>off</td><td>don't read or write the <a href="usage.html#since">run cache</a></td></tr>
 <tr><td><code>-w, --workflow</code></td><td>all</td><td>only this workflow: file name (<code>nightly.yml</code> or <code>nightly</code>), path, display name or id; repeatable</td></tr>
 <tr><td><code>-f, --format</code></td><td>text</td><td><code>text</code>, <code>json</code>, <code>markdown</code></td></tr>
 <tr><td><code>--org</code></td><td></td><td>org-wide scan (same as <code>cronlag org &lt;org&gt;</code>)</td></tr>
@@ -28,7 +30,8 @@
 <table><tr><th>Input</th><th>Default</th><th></th></tr>
 <tr><td><code>mode</code></td><td>report</td><td><code>report</code> or <code>guard</code></td></tr>
 <tr><td><code>repo</code></td><td>this repo</td><td>owner/repo</td></tr>
-<tr><td><code>days</code></td><td>7</td><td>report window</td></tr>
+<tr><td><code>days</code></td><td>7</td><td>report window, up to 400</td></tr>
+<tr><td><code>since</code></td><td></td><td>window start instead of <code>days</code> (same forms as <code>--since</code>); overrides <code>days</code></td></tr>
 <tr><td><code>workflow</code></td><td></td><td>comma-separated file names</td></tr>
 <tr><td><code>fail-on</code></td><td>never</td><td>as the CLI flag</td></tr>
 <tr><td><code>token</code></td><td><code>github.token</code></td><td>needs actions:read</td></tr></table>

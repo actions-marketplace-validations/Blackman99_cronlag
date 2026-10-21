@@ -15,7 +15,7 @@
 <h2>Will catch-up cause double runs?</h2>
 <p>Catch-up only dispatches a slot that has no run after the grace period, and never the same slot twice. If GitHub's delayed run arrives later anyway, add the guard job and it will skip. Without the guard, make the job idempotent (most refresh jobs already are) or use a <code>concurrency</code> group.</p>
 <h2>Does moving off minute 0 help?</h2>
-<p>Sometimes. GitHub recommends it, and cronlag suggests a quieter minute. But the 2026 threads show off-peak schedules (:15, :23, :38, :47) failing too, so measure before and after with <code>cronlag --days 14</code>.</p>
+<p>Sometimes. GitHub recommends it, and cronlag suggests a quieter minute. But the 2026 threads show off-peak schedules (:15, :23, :38, :47) failing too, so measure before and after with <code>cronlag --since</code> the day you moved it.</p>
 <h2>Private repos? GitHub Enterprise?</h2>
 <p>Private repos work with a token that has Actions: read. GHES: point the library's <code>GitHub</code> client at your API base (<code>apiBase</code>); a CLI flag is on the roadmap.</p>
 <h2>Is anything sent anywhere?</h2>

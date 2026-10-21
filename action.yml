@@ -15,9 +15,13 @@ inputs:
     required: false
     default: ""
   days:
-    description: "Window to inspect in days (report mode)"
+    description: "Window to inspect in days, up to 400 (report mode)"
     required: false
     default: "7"
+  since:
+    description: "Window start instead of days: a UTC date (2026-09-01), date-time (2026-09-01T06:00Z) or relative (36h, 30d, 6w). Overrides days. The Action does not cache runs between jobs."
+    required: false
+    default: ""
   workflow:
     description: "Only these workflows (file names, comma-separated)"
     required: false

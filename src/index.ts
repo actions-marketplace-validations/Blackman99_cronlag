@@ -6,3 +6,5 @@ export * from "./collect.js";
 export * from "./format.js";
 export { VERSION } from "./version.js";
 export * from "./org.js";
+export * from "./window.js";
+export { DiskRunCache, defaultCacheDir } from "./cache.js";

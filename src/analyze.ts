@@ -165,6 +165,21 @@ export function attribute(slotTimes: { at: number; cron: string }[], runs: Run[]
   return { slots, claimed, extra };
 }
 
+/**
+ * The same minute field moved off minute 0 without changing how often it fires:
+ * "0 6 * * *" → "37 6 * * *", "*\/5" → "3-59/5", "0,30" → "7,37".
+ */
+export function offMinute(minutes: number[], seed = 0): string {
+  const picks = [7, 13, 17, 23, 37, 43, 47, 53];
+  if (minutes.length <= 1) return String(picks[seed % picks.length]);
+  const sorted = [...minutes].sort((a, b) => a - b);
+  const k = sorted[1] - sorted[0];
+  const evenly = sorted[0] === 0 && 60 % k === 0 && sorted.length === 60 / k && sorted.every((m, i) => m === i * k);
+  if (evenly && k > 1 && sorted.length >= 4) return `${1 + (seed % (k - 1))}-59/${k}`;
+  const off = picks.map((p) => p % 60).find((o) => sorted.every((m) => (m + o) % 60 !== 0)) ?? 1;
+  return sorted.map((m) => (m + off) % 60).sort((a, b) => a - b).join(",");
+}
+
 export function analyzeWorkflow(w: WorkflowInput, snap: Snapshot, t: Thresholds = DEFAULTS): WorkflowReport {
   const findings: Finding[] = [];
   const file = w.path.split("/").pop() ?? w.path;
@@ -262,7 +277,8 @@ export function analyzeWorkflow(w: WorkflowInput, snap: Snapshot, t: Thresholds 
     headline = `median lag ${fmtDur(stats.lagMedian)}`;
   }
   if (verdict === "DROPPING" && (stats.lagMedian ?? 0) > t.lateMs) headline += `, and the rest ran a median ${fmtDur(stats.lagMedian)} late`;
-  if (stats.overdue && verdict !== "NOT FIRING") headline += ` · ${stats.overdue} overdue now`;
+  // A disabled workflow is not expected to fire, so "overdue" adds nothing to the headline.
+  if (stats.overdue && verdict !== "NOT FIRING" && verdict !== "DISABLED") headline += ` · ${stats.overdue} overdue now`;
 
   // ---- cause checks
   if (w.state === "disabled_inactivity") {
@@ -295,7 +311,7 @@ export function analyzeWorkflow(w: WorkflowInput, snap: Snapshot, t: Thresholds 
         level: hurt ? "warn" : "info",
         code: "top-of-hour",
         message: `"${s.cron}" fires at minute 0, GitHub's busiest minute (its docs recommend another one).${hurt ? " Moving it can help, though off-peak schedules were also hit in the Aug–Oct 2026 incidents." : ""}`,
-        fix: `cron: '${[String([7, 13, 17, 23, 37, 43, 47, 53][w.id % 8]), ...s.cron.split(/\s+/).slice(1)].join(" ")}'`,
+        fix: `cron: '${[offMinute(s.parsed.minutes, w.id), ...s.cron.split(/\s+/).slice(1)].join(" ")}'`,
       });
     }
     if (s.timezone !== "UTC") findings.push({ level: "info", code: "timezone", message: `"${s.cron}" is evaluated in ${s.timezone}.` });
@@ -314,7 +330,8 @@ export function analyzeWorkflow(w: WorkflowInput, snap: Snapshot, t: Thresholds 
       });
     }
   }
-  if (w.fileChangedAt && valid.length) {
+  // "not registered" only makes sense for an enabled workflow; a disabled one explains itself.
+  if (w.fileChangedAt && valid.length && w.state === "active") {
     const since = slots.filter((s) => s.at > (w.fileChangedAt as number) && s.status !== "pending");
     const ranSince = w.scheduleRuns.some((r) => r.created > (w.fileChangedAt as number));
     if (since.length >= 2 && !ranSince && now - since[0].at > 2 * HOUR) {

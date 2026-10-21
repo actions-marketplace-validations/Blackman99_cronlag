@@ -32,9 +32,23 @@ def frame(lines):
     d.text((W // 2 - 60, 5), "cronlag — demo", font=FONT, fill=(233, 239, 230))
     for r, segs in enumerate(lines[-ROWS:]):
         x = PAD
+        y = 26 + PAD + r * LH
         for text, color, bold in segs:
-            d.text((x, 26 + PAD + r * LH), text, font=BOLD if bold else FONT, fill=color)
-            x += CW * len(text)
+            # Draw the lag bars (U+2581..U+2588) as crisp rectangles with a 1px gap: the font's block
+            # glyphs are wider than the 9px cell, so they smear into one solid band.
+            run = ""
+            for ch in text + "\0":
+                if "\u2581" <= ch <= "\u2588" or ch == "\0":
+                    if run:
+                        d.text((x, y), run, font=BOLD if bold else FONT, fill=color)
+                        x += CW * len(run)
+                        run = ""
+                    if ch != "\0":
+                        h = round((ord(ch) - 0x2580) / 8 * (LH - 4))
+                        d.rectangle([x + 1, y + LH - 3 - h, x + CW - 2, y + LH - 4], fill=color)
+                        x += CW
+                else:
+                    run += ch
     return im
 
 args = sys.argv[1:]

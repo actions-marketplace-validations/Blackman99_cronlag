@@ -7,6 +7,8 @@ import { GitHub, GitHubError } from "./github.js";
 import { runMcp } from "./mcp.js";
 import { findToken, repoFromGit } from "./token.js";
 import { VERSION } from "./version.js";
+import { DiskRunCache, defaultCacheDir, tildify } from "./cache.js";
+import { MAX_WINDOW_DAYS, resolveWindow, WindowError } from "./window.js";
 import { readTriggers } from "./workflow.js";
 import { appendFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -26,7 +28,10 @@ Usage
   cronlag mcp                             MCP server on stdio (read-only tools)
 
 Options
-  -d, --days <n>          window to inspect (default 7, max 90)
+  -d, --days <n>          window to inspect (default 7, max ${MAX_WINDOW_DAYS})
+  -s, --since <when>      window start instead of --days: 2026-09-01, 2026-09-01T06:00Z (UTC),
+                          or relative 36h / 30d / 6w
+      --no-cache          don't read or write the run cache (always refetch from the API)
   -w, --workflow <x>      only this workflow (file, path, name or id); repeatable
   -f, --format <fmt>      text | json | markdown (default text)
       --org <org>         org-wide scan (same as \`cronlag org <org>\`)
@@ -38,6 +43,8 @@ Options
   -h, --help / -v, --version
 
 Public repos work without a token (60 API calls/hour); private repos need actions:read.
+Run cache: settled days of runs are kept in ${tildify(defaultCacheDir())} (CRONLAG_CACHE_DIR to move it),
+so a second long-window report only fetches the last day or so.
 Org scan skips archived repos and uses --lite for fewer API calls. catchup --dispatch needs actions:write.
 Docs: https://blackman99.github.io/cronlag/docs/`;
 
@@ -47,9 +54,9 @@ interface Args {
   flags: Record<string, string[]>;
 }
 
-const SHORT: Record<string, string> = { d: "days", w: "workflow", f: "format", h: "help", v: "version", n: "count" };
-const BOOL = new Set(["help", "version", "no-color", "dispatch", "lite", "json"]);
-const VALUED = new Set(["days", "workflow", "format", "count", "fail-on", "late", "on-time", "token", "grace", "tz", "cron", "org"]);
+const SHORT: Record<string, string> = { s: "since", d: "days", w: "workflow", f: "format", h: "help", v: "version", n: "count" };
+const BOOL = new Set(["help", "version", "no-color", "no-cache", "dispatch", "lite", "json"]);
+const VALUED = new Set(["days", "since", "workflow", "format", "count", "fail-on", "late", "on-time", "token", "grace", "tz", "cron", "org"]);
 
 export function parseArgs(argv: string[]): Args {
   const flags: Record<string, string[]> = {};
@@ -128,8 +135,11 @@ async function main(argv: string[]): Promise<number> {
   }
   const color = !a.flags["no-color"] && !process.env.NO_COLOR && (process.stdout.isTTY || !!process.env.FORCE_COLOR);
 
+  const useCache = !a.flags["no-cache"] && !/^(1|true|yes)$/i.test(process.env.CRONLAG_NO_CACHE ?? "");
+  const cache = useCache ? new DiskRunCache() : undefined;
+
   if (a.cmd === "mcp") {
-    await runMcp(() => new GitHub({ token: findToken(one(a, "token")), userAgent: `cronlag/${VERSION}` }));
+    await runMcp(() => new GitHub({ token: findToken(one(a, "token")), userAgent: `cronlag/${VERSION}`, cache }));
     return 0;
   }
 
@@ -162,7 +172,10 @@ async function main(argv: string[]): Promise<number> {
   }
 
   const token = findToken(one(a, "token"));
-  const gh = new GitHub({ token, userAgent: `cronlag/${VERSION}` });
+  // catchup and guard decide what to dispatch/skip right now: always read the API directly.
+  const live = a.cmd === "catchup" || a.cmd === "guard";
+  const gh = new GitHub({ token, userAgent: `cronlag/${VERSION}`, cache: live ? undefined : cache });
+  if (live && (one(a, "since") || one(a, "days"))) throw new UsageError(`${a.cmd} looks at the latest due slots only; --since / --days apply to reports`);
 
   if (a.cmd === "guard") {
     const repo = process.env.GITHUB_REPOSITORY;
@@ -203,16 +216,36 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
 
-  const days = Math.min(90, Math.max(1, Number(one(a, "days") ?? 7)));
+  let win: ReturnType<typeof resolveWindow>;
+  try {
+    win = resolveWindow({ days: one(a, "days"), since: one(a, "since") });
+  } catch (e) {
+    if (e instanceof WindowError) throw new UsageError(e.message);
+    throw e;
+  }
   const t = thresholds(a);
-  if (!token && process.stderr.isTTY) console.error("(no GitHub token found — public repos only, 60 API calls/hour)");
+  if (!token && process.stderr.isTTY) {
+    console.error(
+      win.days > 30
+        ? `(no GitHub token found — public repos only, 60 API calls/hour; a ${Math.round(win.days)}-day window can need more on the first run)`
+        : "(no GitHub token found — public repos only, 60 API calls/hour)",
+    );
+  }
+  const runNote = () => {
+    const st = gh.runStats;
+    if (st.truncated) console.error("cronlag: warning — a single day had more than 1000 runs of one workflow; GitHub's API returns at most 1000, so some runs (and lag numbers) are missing");
+    if (!process.stderr.isTTY || !st.days) return;
+    const note = (msg: string) => console.error(color ? `\x1b[2m${msg}\x1b[0m` : msg);
+    if (st.cachedDays) note(`(cached: ${st.cachedDays} of ${st.days} days of runs from ${gh.cacheLocation} · ${st.pages} API request${st.pages === 1 ? "" : "s"} for the rest)`);
+    else if (win.days > 7 && cache) note(`(${st.pages} API requests for runs; finished days are now cached in ${gh.cacheLocation}, so the next run reuses them)`);
+  };
 
   const orgName = a.cmd === "org" ? a.pos[0] : one(a, "org");
   if (a.cmd === "org" || orgName) {
     if (!orgName) throw new UsageError("org needs a name, e.g. cronlag org github");
     const progress = process.stderr.isTTY ? (msg: string) => console.error(msg) : undefined;
     const report = await scanOrg(gh, orgName, {
-      days,
+      from: win.from,
       workflows: a.flags.workflow,
       thresholds: t,
       onProgress: progress,
@@ -221,6 +254,7 @@ async function main(argv: string[]): Promise<number> {
     if (format === "json") console.log(JSON.stringify(report, null, 2));
     else if (format === "markdown" || format === "md") console.log(formatOrgMarkdown(report));
     else console.log(formatOrgText(report, { color, width: process.stdout.columns }));
+    runNote();
     return exitForOrg(report, one(a, "fail-on") ?? "never");
   }
 
@@ -244,12 +278,13 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
 
-  const snap = await collect(gh, repo, { days, workflows: a.flags.workflow, lite: !!a.flags.lite });
+  const snap = await collect(gh, repo, { from: win.from, workflows: a.flags.workflow, lite: !!a.flags.lite });
   const report = analyze(snap, t);
   const format = one(a, "format") ?? (a.flags.json ? "json" : "text");
   if (format === "json") console.log(JSON.stringify(report, null, 2));
   else if (format === "markdown" || format === "md") console.log(formatMarkdown(report));
   else console.log(formatText(report, { color, width: process.stdout.columns }));
+  runNote();
   return exitFor(report, one(a, "fail-on") ?? "never");
 }
 
@@ -269,19 +304,23 @@ function isEntryPoint(): boolean {
 }
 const isDirect = isEntryPoint();
 if (isDirect) {
+  // Set exitCode instead of calling process.exit(): exit() drops whatever stdout still has
+  // buffered for a pipe, which cut long --format json reports off at 64 KiB.
   main(process.argv.slice(2)).then(
-    (code) => process.exit(code),
+    (code) => {
+      process.exitCode = code;
+    },
     (e) => {
       if (e instanceof UsageError) {
         console.error(`cronlag: ${e.message}\nRun \`cronlag --help\` for usage.`);
-        process.exit(2);
-      }
-      if (e instanceof GitHubError) {
+        process.exitCode = 2;
+      } else if (e instanceof GitHubError) {
         console.error(`cronlag: ${e.message}`);
-        process.exit(3);
+        process.exitCode = 3;
+      } else {
+        console.error(e);
+        process.exitCode = 3;
       }
-      console.error(e);
-      process.exit(3);
     },
   );
 }

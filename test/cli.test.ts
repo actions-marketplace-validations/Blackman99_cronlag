@@ -20,9 +20,9 @@ test("usage errors exit 2", () => {
 });
 
 test("unknown options are rejected instead of silently ignored", () => {
-  const r = spawnSync(process.execPath, [CLI, "o/r", "--since", "24h"], { encoding: "utf8" });
+  const r = spawnSync(process.execPath, [CLI, "o/r", "--until", "24h"], { encoding: "utf8" });
   assert.equal(r.status, 2);
-  assert.match(r.stderr, /unknown option --since/);
+  assert.match(r.stderr, /unknown option --until/);
   const t = spawnSync(process.execPath, [CLI, "explain", "17 * * * *", "--tzz=UTC"], { encoding: "utf8" });
   assert.equal(t.status, 2);
   const ok = spawnSync(process.execPath, [CLI, "explain", "17 * * * *", "--tz=Europe/Berlin", "-n", "1", "--no-color"], { encoding: "utf8" });
@@ -54,4 +54,40 @@ test("MCP stdio: initialize, tools/list, cron_explain", async () => {
   const out = JSON.parse(byId[3].result.content[0].text);
   assert.equal(out.next.length, 3);
   assert.equal(out.shortestInterval, "6h00");
+});
+
+test("--since / --days usage errors exit 2 before any API call", () => {
+  const cases: [string[], RegExp][] = [
+    [["--since", "2026-09-01", "--days", "3"], /either --days or --since, not both/],
+    [["--since", "last tuesday"], /not a date — use 2026-09-01/],
+    [["-s", "2099-01-01"], /in the future/],
+    [["--since=15m"], /shortest window is 1h/],
+    [["--since", "2020-01-01"], /longest window is 400 days/],
+    [["--days", "0"], /not a positive number/],
+    [["--days", "1000"], /longest window is 400 days/],
+  ];
+  for (const [args, re] of cases) {
+    const r = spawnSync(process.execPath, [CLI, "o/r", ...args], { encoding: "utf8", env: { ...process.env, GITHUB_TOKEN: "x" } });
+    assert.equal(r.status, 2, `${args.join(" ")}: ${r.stderr}`);
+    assert.match(r.stderr, re);
+  }
+  const c = spawnSync(process.execPath, [CLI, "catchup", "o/r", "--since", "3d"], { encoding: "utf8", env: { ...process.env, GITHUB_TOKEN: "x" } });
+  assert.equal(c.status, 2);
+  assert.match(c.stderr, /catchup looks at the latest due slots only/);
+});
+
+test("help documents --since, --no-cache and the cache dir", () => {
+  const r = spawnSync(process.execPath, [CLI, "--help"], { encoding: "utf8", env: { ...process.env, CRONLAG_CACHE_DIR: "/tmp/cronlag-help-test" } });
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /-s, --since <when>/);
+  assert.match(r.stdout, /--no-cache/);
+  assert.match(r.stdout, /max 400/);
+  assert.match(r.stdout, /cronlag-help-test/);
+});
+
+test("large JSON output reaches a pipe in full (no 64 KiB cut-off on exit)", () => {
+  const r = spawnSync(process.execPath, [CLI, "explain", "*/5 * * * *", "-n", "6000", "--format", "json"], { encoding: "utf8", maxBuffer: 1 << 24 });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(r.stdout.length > 65536 * 2, `got ${r.stdout.length} bytes`);
+  assert.equal(JSON.parse(r.stdout).next.length, 6000);
 });

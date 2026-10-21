@@ -10,9 +10,9 @@ Core goal: see [GOAL.md](GOAL.md). Every item below must make that answer more a
 - `cronlag catchup [--dispatch]` and `cronlag guard` / Action `mode: guard` for idempotent catch-up.
 - Output: text, JSON, Markdown; Action job summary + outputs; MCP stdio server (`schedule_report`, `catchup_plan`, `cron_explain`).
 
-## v0.2 — reach the people who need it
+## v0.2 — reach the people who need it (v0.2.0 released 2026-10-21)
 - [x] Org-wide scan (2026-10-14): `cronlag org <org>` and `cronlag --org <org>` — all non-archived repos with schedules, worst first; text/JSON/markdown; `--fail-on` across the org.
-- `--since <date>` and longer windows with caching of run pages.
+- [x] `--since <date>` and longer windows with caching of run pages (2026-10-21): `--since 2026-09-01` / `2026-09-01T06:00Z` / `30d`, windows up to 400 days read in full past the API's 1000-result cap, settled days cached on disk (`--no-cache`); CLI, `org`, Action `since` input, MCP `schedule_report.since`.
 - Publish to npm (needs the user's npm account / Trusted Publishing).
 - Ready-made external schedulers for catch-up: `cronlag worker` prints a Cloudflare Worker (cron trigger) and a systemd timer.
 

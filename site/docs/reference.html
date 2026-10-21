@@ -44,7 +44,7 @@
   "unscheduled": [ "ci.yml", … ] }</code></pre>
 <p>Times are epoch milliseconds in <code>slots</code>, ISO strings at the top level. Durations are milliseconds.</p>
 <h2>Exit codes</h2>
-<p><code>0</code> ok (or nothing matched <code>--fail-on</code>) · <code>1</code> a workflow matched <code>--fail-on</code> · <code>2</code> usage error (including an unknown option) / invalid cron · <code>3</code> GitHub API error (rate limit, not found, auth).</p>
+<p><code>0</code> ok (or nothing matched <code>--fail-on</code>) · <code>1</code> a workflow matched <code>--fail-on</code> · <code>2</code> usage error (an unknown option, a bad <code>--since</code> / <code>--days</code>) / invalid cron · <code>3</code> GitHub API error (rate limit, not found, auth).</p>
 <h2>MCP tools</h2>
 <p><code>schedule_report</code> returns the Markdown report plus compact JSON; <code>catchup_plan</code> returns the steps <code>catchup</code> would take (never dispatches); <code>cron_explain</code> returns next fire times, shortest interval and the minute-0 flag. All are annotated <code>readOnlyHint: true</code>.</p></main>
 <footer class="dfoot"><a href="https://github.com/Blackman99/cronlag">GitHub</a> · <a href="https://github.com/Blackman99/cronlag/issues">Issues</a> · MIT</footer>

@@ -132,16 +132,17 @@
     <pre class="term" id="term"><code>cronlag  robhunter/agentdeals  · last 7 days · times UTC
 
 reverify.yml  "Daily rolling re-verification"  <i class="c">0 6 * * *</i>
-  <i class="v">▇▇▇▆▇▇▇</i>
+  <i class="v">▆▆▆▆▆▇▆</i>
   7 slots · 7 ran · 0 missed   on time 0/7 · within 1h 0/7
-  lag  min 5h55 · median <b>6h40</b> · p90 7h56 · max 8h27
-  <i class="l"><b>LATE</b></i>       median run is created 6h40 after its cron slot
+  lag  min 4h10 · median <b>4h52</b> · p90 5h35 · max 6h09
+  <i class="l"><b>LATE</b></i>       median run is created 4h52 after its cron slot
   <i class="l">!</i> "0 6 * * *" fires at minute 0, GitHub's busiest minute (its docs recommend another one).
     → cron: '37 6 * * *'
   <i class="d">· Lag is measured from the cron slot to run creation, before any runner is involved —
     that part is GitHub's scheduler, not your jobs.</i>
     → run `cronlag catchup robhunter/agentdeals --dispatch` from an external cron every 10–15 min</code></pre>
     <p>No token needed for public repos (60 API calls an hour); with <code>gh auth login</code> or <code>GITHUB_TOKEN</code> it reads private ones too. <code>--format markdown</code> pastes straight into the issue you were about to write by hand.</p>
+    <p>To see when it started, look further back: <code>--since 2026-08-15</code> shows this job created within the hour every morning until 26 August, then 4 to 12 hours late every day from the 27th on. Windows go up to 400 days, and finished days are cached on disk, so asking again tomorrow only fetches tomorrow.</p>
   </section>
 
   <section class="link l" id="why-section">

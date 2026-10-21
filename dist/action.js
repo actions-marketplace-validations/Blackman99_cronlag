@@ -264,6 +264,16 @@ function attribute(slotTimes, runs, t) {
   }
   return { slots, claimed, extra };
 }
+function offMinute(minutes, seed = 0) {
+  const picks = [7, 13, 17, 23, 37, 43, 47, 53];
+  if (minutes.length <= 1) return String(picks[seed % picks.length]);
+  const sorted = [...minutes].sort((a, b) => a - b);
+  const k = sorted[1] - sorted[0];
+  const evenly = sorted[0] === 0 && 60 % k === 0 && sorted.length === 60 / k && sorted.every((m, i) => m === i * k);
+  if (evenly && k > 1 && sorted.length >= 4) return `${1 + seed % (k - 1)}-59/${k}`;
+  const off = picks.map((p) => p % 60).find((o) => sorted.every((m) => (m + o) % 60 !== 0)) ?? 1;
+  return sorted.map((m) => (m + off) % 60).sort((a, b) => a - b).join(",");
+}
 function analyzeWorkflow(w, snap, t = DEFAULTS) {
   const findings = [];
   const file = w.path.split("/").pop() ?? w.path;
@@ -353,7 +363,7 @@ function analyzeWorkflow(w, snap, t = DEFAULTS) {
     headline = `median lag ${fmtDur(stats.lagMedian)}`;
   }
   if (verdict === "DROPPING" && (stats.lagMedian ?? 0) > t.lateMs) headline += `, and the rest ran a median ${fmtDur(stats.lagMedian)} late`;
-  if (stats.overdue && verdict !== "NOT FIRING") headline += ` \xB7 ${stats.overdue} overdue now`;
+  if (stats.overdue && verdict !== "NOT FIRING" && verdict !== "DISABLED") headline += ` \xB7 ${stats.overdue} overdue now`;
   if (w.state === "disabled_inactivity") {
     findings.push({
       level: "error",
@@ -384,7 +394,7 @@ function analyzeWorkflow(w, snap, t = DEFAULTS) {
         level: hurt ? "warn" : "info",
         code: "top-of-hour",
         message: `"${s.cron}" fires at minute 0, GitHub's busiest minute (its docs recommend another one).${hurt ? " Moving it can help, though off-peak schedules were also hit in the Aug\u2013Oct 2026 incidents." : ""}`,
-        fix: `cron: '${[String([7, 13, 17, 23, 37, 43, 47, 53][w.id % 8]), ...s.cron.split(/\s+/).slice(1)].join(" ")}'`
+        fix: `cron: '${[offMinute(s.parsed.minutes, w.id), ...s.cron.split(/\s+/).slice(1)].join(" ")}'`
       });
     }
     if (s.timezone !== "UTC") findings.push({ level: "info", code: "timezone", message: `"${s.cron}" is evaluated in ${s.timezone}.` });
@@ -403,7 +413,7 @@ function analyzeWorkflow(w, snap, t = DEFAULTS) {
       });
     }
   }
-  if (w.fileChangedAt && valid.length) {
+  if (w.fileChangedAt && valid.length && w.state === "active") {
     const since = slots.filter((s) => s.at > w.fileChangedAt && s.status !== "pending");
     const ranSince = w.scheduleRuns.some((r) => r.created > w.fileChangedAt);
     if (since.length >= 2 && !ranSince && now - since[0].at > 2 * HOUR) {
@@ -7926,8 +7936,7 @@ function matchesFilter(w, filters) {
 }
 async function collect(gh, fullName, o = {}) {
   const now = o.now ?? Date.now();
-  const days = o.days ?? 7;
-  const from = now - days * DAY;
+  const from = o.from ?? now - (o.days ?? 7) * DAY;
   const repo = await gh.repo(fullName);
   o.onProgress?.(`${repo.fullName}: listing workflows`);
   const all = (await gh.workflows(repo.fullName)).filter((w) => matchesFilter(w, o.workflows));
@@ -7955,8 +7964,8 @@ async function collect(gh, fullName, o = {}) {
     if (!trig.schedules.length && !/^\s*schedule\s*:/m.test(text)) continue;
     o.onProgress?.(`${w.path}: reading runs`);
     const [scheduleRuns, dispatchRuns, history] = await Promise.all([
-      gh.runs(repo.fullName, w.id, { event: "schedule", since: from - DAY }),
-      trig.hasDispatch ? gh.runs(repo.fullName, w.id, { event: "workflow_dispatch", since: from - DAY, maxPages: 1 }) : Promise.resolve([]),
+      gh.runsWindow(repo.fullName, w.id, { event: "schedule", since: from - DAY, now }),
+      trig.hasDispatch ? gh.runsWindow(repo.fullName, w.id, { event: "workflow_dispatch", since: from - DAY, now }) : Promise.resolve([]),
       o.lite ? Promise.resolve(null) : gh.fileHistory(repo.fullName, w.path, repo.defaultBranch).catch(() => null)
     ]);
     let timeline;
@@ -7996,6 +8005,79 @@ var init_collect = __esm({
   }
 });
 
+// src/window.ts
+function parseSince(input2, now = Date.now()) {
+  const s = input2.trim();
+  const rel = s.match(/^(\d+(?:\.\d+)?)\s*(h|hours?|d|days?|w|weeks?)$/i);
+  let from;
+  if (rel) {
+    const n = Number(rel[1]);
+    const u = rel[2][0].toLowerCase();
+    from = now - n * (u === "h" ? HOUR2 : u === "w" ? 7 * DAY2 : DAY2);
+  } else if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    from = Date.parse(`${s}T00:00:00Z`);
+    if (!Number.isFinite(from) || new Date(from).toISOString().slice(0, 10) !== s) throw new WindowError(`--since ${s} is not a real calendar date`);
+  } else if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$/i.test(s)) {
+    const zoned = /(Z|[+-]\d{2}:?\d{2})$/i.test(s);
+    from = Date.parse(s.replace(" ", "T") + (zoned ? "" : "Z"));
+    if (!Number.isFinite(from)) throw new WindowError(`--since ${s} is not a valid date-time`);
+  } else if (/^\d+\s*(m|min|mins|minutes?)$/i.test(s)) {
+    throw new WindowError(`--since ${s}: the shortest window is 1h \u2014 use hours, days or weeks (36h, 30d, 6w)`);
+  } else {
+    throw new WindowError(`--since "${s}" is not a date \u2014 use 2026-09-01, 2026-09-01T06:00Z, or a relative 36h / 30d / 6w`);
+  }
+  if (from > now) throw new WindowError(`--since ${iso16(from)} UTC is in the future`);
+  const span = now - from;
+  if (span < HOUR2) throw new WindowError(`--since ${s} is less than an hour ago; the shortest window is 1h`);
+  if (span > MAX_WINDOW_DAYS * DAY2 + (rel ? 0 : DAY2)) {
+    throw new WindowError(`--since ${s} is ${Math.floor(span / DAY2)} days back; the longest window is ${MAX_WINDOW_DAYS} days (try --since ${MAX_WINDOW_DAYS}d)`);
+  }
+  return Math.max(from, now - (MAX_WINDOW_DAYS + 1) * DAY2);
+}
+function parseDays(input2) {
+  const n = typeof input2 === "number" ? input2 : Number(String(input2).trim());
+  if (!Number.isFinite(n) || n <= 0) throw new WindowError(`--days ${input2} is not a positive number of days`);
+  if (n > MAX_WINDOW_DAYS) throw new WindowError(`--days ${input2} is too long; the longest window is ${MAX_WINDOW_DAYS} days`);
+  return n;
+}
+function resolveWindow(o, now = Date.now()) {
+  const hasDays = o.days !== void 0 && o.days !== "";
+  const hasSince = o.since !== void 0 && o.since !== "";
+  if (hasDays && hasSince) throw new WindowError("use either --days or --since, not both");
+  if (hasSince) {
+    const from = parseSince(o.since, now);
+    return { from, days: (now - from) / DAY2, since: true };
+  }
+  const days = hasDays ? parseDays(o.days) : DEFAULT_WINDOW_DAYS;
+  return { from: now - days * DAY2, days, since: false };
+}
+function windowLabel(fromIso, nowIso) {
+  const from = Date.parse(fromIso);
+  const now = Date.parse(nowIso);
+  const span = now - from;
+  const whole = (unit) => Math.abs(span / unit - Math.round(span / unit)) < 1e-6;
+  if (span < 2 * DAY2 && whole(HOUR2)) return `last ${Math.round(span / HOUR2)}h`;
+  if (whole(DAY2)) {
+    const d = Math.round(span / DAY2);
+    return `last ${d} day${d === 1 ? "" : "s"}`;
+  }
+  const days = span / DAY2;
+  return `since ${iso16(from)} (${days < 10 ? days.toFixed(1) : Math.round(days)} days)`;
+}
+var HOUR2, DAY2, MAX_WINDOW_DAYS, DEFAULT_WINDOW_DAYS, WindowError, iso16;
+var init_window = __esm({
+  "src/window.ts"() {
+    "use strict";
+    HOUR2 = 36e5;
+    DAY2 = 24 * HOUR2;
+    MAX_WINDOW_DAYS = 400;
+    DEFAULT_WINDOW_DAYS = 7;
+    WindowError = class extends Error {
+    };
+    iso16 = (t) => new Date(t).toISOString().slice(0, 16).replace("T", " ");
+  }
+});
+
 // src/format.ts
 function slotGlyph(s) {
   switch (s.status) {
@@ -8014,6 +8096,24 @@ function slotGlyph(s) {
     }
   }
 }
+function compactSlots(slots, max) {
+  if (slots.length <= max) return { marks: slots.map((slot) => ({ slot })), per: 1 };
+  const per = Math.ceil(slots.length / max);
+  const marks = [];
+  for (let i = 0; i < slots.length; i += per) {
+    const group = slots.slice(i, i + per);
+    const worst = group.reduce((w, s) => {
+      const d = SEVERITY[s.status] - SEVERITY[w.status];
+      return d > 0 || d === 0 && (s.lagMs ?? 0) > (w.lagMs ?? 0) ? s : w;
+    });
+    const missed = group.filter((s) => s.status === "missed").length;
+    marks.push(missed && missed < group.length && group.some((s) => s.run) ? { slot: worst, someMissed: true } : { slot: worst });
+  }
+  return { marks, per };
+}
+function markGlyph(m) {
+  return m.someMissed ? { ch: "x", tone: "magenta" } : slotGlyph(m.slot);
+}
 function wrap(text, width) {
   const out = [];
   let cur = "";
@@ -8030,28 +8130,31 @@ function formatText(r, o) {
   const c = (k, s) => o.color ? C[k] + s + C.reset : s;
   const width = Math.max(40, Math.min(o.width ?? 100, 120));
   const lines = [];
-  lines.push(`${c("bold", "cronlag")}  ${r.repo}  ${c("dim", `\xB7 last ${r.days} days \xB7 times UTC`)}`);
+  lines.push(`${c("bold", "cronlag")}  ${r.repo}  ${c("dim", `\xB7 ${windowLabel(r.from, r.now)} \xB7 times UTC`)}`);
   if (!r.workflows.length) {
     lines.push("");
     lines.push(`No scheduled workflows found${r.unscheduled.length ? ` (${r.unscheduled.length} workflows without \`on: schedule\`)` : ""}.`);
     return lines.join("\n");
   }
+  const perLine = Math.max(20, width - 4);
+  let folded = false;
   for (const w of r.workflows) {
     lines.push("");
     const crons = w.crons.map((x) => `${x.cron}${x.timezone !== "UTC" ? ` (${x.timezone})` : ""}`).join("  |  ");
     lines.push(`${c("bold", w.file)}  ${c("dim", `"${w.name}"`)}  ${c("cyan", crons)}`);
     for (const ch of w.changes) lines.push(`  ${c("dim", `schedule changed ${ch.at.slice(0, 16).replace("T", " ")} \u2192 ${ch.crons.join(", ") || "(none)"}; earlier slots use the old cron`)}`);
-    const perLine = Math.max(20, width - 4);
-    for (let i = 0; i < w.slots.length; i += perLine) {
-      const chunk = w.slots.slice(i, i + perLine);
-      lines.push("  " + chunk.map((s2) => {
-        const g = slotGlyph(s2);
+    const strip = compactSlots(w.slots, perLine * 3);
+    if (strip.per > 1) folded = true;
+    for (let i = 0; i < strip.marks.length; i += perLine) {
+      const chunk = strip.marks.slice(i, i + perLine);
+      lines.push("  " + chunk.map((m) => {
+        const g = markGlyph(m);
         return c(g.tone, g.ch);
       }).join(""));
     }
     const s = w.stats;
     if (w.slots.length) {
-      lines.push(`  ${s.due} slots \xB7 ${s.ran} ran \xB7 ${s.missed ? c("magenta", `${s.missed} missed`) : "0 missed"}${s.overdue ? ` \xB7 ${c("magenta", `${s.overdue} overdue`)}` : ""}${s.ran ? `   on time ${s.onTime}/${s.ran} \xB7 within 1h ${s.within1h}/${s.ran}` : ""}`);
+      lines.push(`  ${s.due} slots${strip.per > 1 ? c("dim", ` (1 mark = worst of ${strip.per})`) : ""} \xB7 ${s.ran} ran \xB7 ${s.missed ? c("magenta", `${s.missed} missed`) : "0 missed"}${s.overdue ? ` \xB7 ${c("magenta", `${s.overdue} overdue`)}` : ""}${s.ran ? `   on time ${s.onTime}/${s.ran} \xB7 within 1h ${s.within1h}/${s.ran}` : ""}`);
       if (s.ran) lines.push(`  lag  min ${fmtDur(s.lagMin)} \xB7 median ${c("bold", fmtDur(s.lagMedian))} \xB7 p90 ${fmtDur(s.lagP90)} \xB7 max ${fmtDur(s.lagMax)}${s.queueMedian !== null && s.queueMedian > 6e4 ? `   queue ${fmtDur(s.queueMedian)}` : ""}`);
     }
     const tone = TONE[w.verdict] ?? "gray";
@@ -8067,15 +8170,16 @@ function formatText(r, o) {
     lines.push(c("dim", `${r.unscheduled.length} other workflow${r.unscheduled.length === 1 ? "" : "s"} without a schedule: ${r.unscheduled.slice(0, 8).join(", ")}${r.unscheduled.length > 8 ? ", \u2026" : ""}`));
   }
   lines.push("");
-  lines.push(c("dim", "bar = lag  \u2581\u22642m \u2582\u226410m \u2583\u226430m \u2584\u22641h \u2585\u22643h \u2586\u22646h \u2587\u226412h \u2588>12h   \u2715 no run   ? not yet"));
+  lines.push(c("dim", `bar = lag  \u2581\u22642m \u2582\u226410m \u2583\u226430m \u2584\u22641h \u2585\u22643h \u2586\u22646h \u2587\u226412h \u2588>12h   \u2715 no run${folded ? "   x some missed" : ""}   ? not yet`));
   return lines.join("\n");
 }
 function mdSlotRow(w) {
-  return w.slots.map((s) => slotGlyph(s).ch).join("");
+  const strip = compactSlots(w.slots, 240);
+  return "`" + strip.marks.map((m) => markGlyph(m).ch).join("") + "`" + (strip.per > 1 ? ` <sub>each mark = ${strip.per} slots: \u2715 none ran, x some missed, else the worst lag</sub>` : "");
 }
 function formatMarkdown(r) {
   const out = [];
-  out.push(`### cronlag \u2014 ${r.repo} (last ${r.days} days, UTC)`);
+  out.push(`### cronlag \u2014 ${r.repo} \xB7 ${windowLabel(r.from, r.now)} \xB7 UTC`);
   out.push("");
   if (!r.workflows.length) {
     out.push("No scheduled workflows found.");
@@ -8092,7 +8196,7 @@ function formatMarkdown(r) {
   for (const w of r.workflows) {
     out.push("");
     out.push(`**${w.file}** \u2014 ${w.verdict}: ${w.headline}`);
-    if (w.slots.length) out.push("", "`" + mdSlotRow(w) + "`");
+    if (w.slots.length) out.push("", mdSlotRow(w));
     for (const f of w.findings) out.push(`- ${f.level === "error" ? "\u2717" : f.level === "warn" ? "\u26A0\uFE0F" : "\xB7"} ${f.message}${f.fix ? ` \u2192 ${f.fix.includes("`") ? f.fix : "`" + f.fix + "`"}` : ""}`);
     const late = w.slots.filter((s) => s.status !== "ontime" && s.status !== "pending").slice(-8);
     if (late.length) {
@@ -8118,7 +8222,7 @@ function formatOrgText(r, o) {
   const c = (k, s) => o.color ? C[k] + s + C.reset : s;
   const lines = [];
   lines.push(
-    `${c("bold", "cronlag")}  org/${r.org}  ${c("dim", `\xB7 last ${r.days} days \xB7 ${r.withSchedules} of ${r.scanned} repos have schedules${r.skippedArchived ? ` \xB7 ${r.skippedArchived} archived skipped` : ""} \xB7 times UTC`)}`
+    `${c("bold", "cronlag")}  org/${r.org}  ${c("dim", `\xB7 ${windowLabel(r.from, r.now)} \xB7 ${r.withSchedules} of ${r.scanned} repos have schedules${r.skippedArchived ? ` \xB7 ${r.skippedArchived} archived skipped` : ""} \xB7 times UTC`)}`
   );
   if (!r.repos.length) {
     lines.push("");
@@ -8152,7 +8256,7 @@ function formatOrgText(r, o) {
 }
 function formatOrgMarkdown(r) {
   const out = [];
-  out.push(`### cronlag \u2014 org/${r.org} (last ${r.days} days, UTC)`);
+  out.push(`### cronlag \u2014 org/${r.org} \xB7 ${windowLabel(r.from, r.now)} \xB7 UTC`);
   out.push("");
   out.push(`${r.withSchedules} of ${r.scanned} repos have schedules${r.skippedArchived ? `; ${r.skippedArchived} archived skipped` : ""}.`);
   out.push("");
@@ -8175,11 +8279,12 @@ function formatOrgMarkdown(r) {
   out.push("", `<sub>Worst first. Generated by [cronlag](https://github.com/Blackman99/cronlag) org scan.</sub>`);
   return out.join("\n");
 }
-var C, BARS, TONE;
+var C, BARS, SEVERITY, TONE;
 var init_format = __esm({
   "src/format.ts"() {
     "use strict";
     init_analyze();
+    init_window();
     C = {
       reset: "\x1B[0m",
       dim: "\x1B[2m",
@@ -8192,11 +8297,24 @@ var init_format = __esm({
       gray: "\x1B[90m"
     };
     BARS = ["\u2581", "\u2582", "\u2583", "\u2584", "\u2585", "\u2586", "\u2587", "\u2588"];
+    SEVERITY = { pending: 0, ontime: 1, late: 2, verylate: 3, overdue: 4, missed: 5 };
     TONE = { "ON TIME": "green", LATE: "yellow", DROPPING: "red", "NOT FIRING": "red", DISABLED: "red", INVALID: "red", "NO DATA": "gray", "NO SCHEDULES": "gray" };
   }
 });
 
 // src/github.ts
+async function pool(tasks, n) {
+  const out = new Array(tasks.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < tasks.length) {
+      const i = next++;
+      out[i] = await tasks[i]();
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(n, tasks.length) }, worker));
+  return out;
+}
 function toRun(x) {
   return {
     id: x.id,
@@ -8209,7 +8327,7 @@ function toRun(x) {
     url: x.html_url
   };
 }
-var GitHubError, GitHub;
+var GitHubError, SETTLE_MS, DAY_MS, QUERY_CAP, GitHub;
 var init_github = __esm({
   "src/github.ts"() {
     "use strict";
@@ -8219,19 +8337,35 @@ var init_github = __esm({
         this.status = status;
       }
     };
+    SETTLE_MS = 6 * 36e5;
+    DAY_MS = 864e5;
+    QUERY_CAP = 1e3;
     GitHub = class {
       token;
       api;
       raw;
       f;
       ua;
+      cache;
       calls = 0;
+      runStats = { pages: 0, cachedDays: 0, days: 0, truncated: false };
       constructor(o = {}) {
         this.token = o.token || void 0;
         this.api = (o.apiBase ?? "https://api.github.com").replace(/\/$/, "");
         this.raw = (o.rawBase ?? "https://raw.githubusercontent.com").replace(/\/$/, "");
         this.f = o.fetch ?? fetch.bind(globalThis);
         this.ua = o.userAgent;
+        this.cache = o.cache;
+      }
+      get cacheLocation() {
+        return this.cache?.location;
+      }
+      get apiHost() {
+        try {
+          return new URL(this.api).host;
+        } catch {
+          return "api";
+        }
       }
       get authenticated() {
         return !!this.token;
@@ -8319,6 +8453,95 @@ var init_github = __esm({
         }
         return out.sort((a, b) => a.created - b.created);
       }
+      /**
+       * All runs of one event created in [since, now], however long the window.
+       * The window is split into UTC days: settled days come from the cache when there is one,
+       * the rest is fetched as few contiguous `created=` range queries as possible (one for a
+       * fresh short window, same API cost as before), halved whenever a range exceeds the API's
+       * 1000-result cap. Days that are settled and fully completed are written back to the cache.
+       */
+      async runsWindow(full, workflowId, opts) {
+        const now = opts.now ?? Date.now();
+        const first = Math.floor(opts.since / DAY_MS) * DAY_MS;
+        const settled = (d) => d + DAY_MS <= now - SETTLE_MS;
+        const key2 = (d) => `${this.apiHost}/${full.toLowerCase()}/${workflowId}/${opts.event}/${new Date(d).toISOString().slice(0, 10)}`;
+        const out = [];
+        const todo = [];
+        for (let d = first; d < now; d += DAY_MS) {
+          this.runStats.days++;
+          if (this.cache && settled(d)) {
+            const hit = await this.cache.get(key2(d)).catch(() => void 0);
+            if (hit) {
+              this.runStats.cachedDays++;
+              out.push(...hit);
+              continue;
+            }
+          }
+          todo.push(d);
+        }
+        const ranges = [];
+        for (const d of todo) {
+          const last = ranges[ranges.length - 1];
+          if (last && last[1] === d) last[1] = d + DAY_MS;
+          else ranges.push([d, d + DAY_MS]);
+        }
+        for (const [a, b] of ranges) {
+          const { runs, complete } = await this.runsRange(full, workflowId, opts.event, a, Math.min(b, now), b >= now);
+          out.push(...runs);
+          if (!this.cache) continue;
+          for (let d = a; d < b; d += DAY_MS) {
+            if (!settled(d) || !complete.has(d)) continue;
+            const day = runs.filter((r) => r.created >= d && r.created < d + DAY_MS);
+            if (day.some((r) => r.status !== "completed")) continue;
+            await this.cache.set(key2(d), day).catch(() => void 0);
+          }
+        }
+        const seen = /* @__PURE__ */ new Set();
+        return out.filter((r) => r.created >= opts.since && r.created <= now && !seen.has(r.id) && (seen.add(r.id), true)).sort((x, y) => x.created - y.created);
+      }
+      /** Runs created in [a, b) (b open-ended when `open`), splitting at day boundaries past the result cap. */
+      async runsRange(full, workflowId, event, a, b, open) {
+        const iso = (t) => new Date(t).toISOString().replace(/\.\d{3}Z$/, "Z");
+        const created = open ? `>=${iso(a)}` : `${iso(a)}..${iso(b - 1e3)}`;
+        const page = async (n) => {
+          const q = new URLSearchParams({ per_page: "100", page: String(n), created, event, exclude_pull_requests: "true" });
+          this.runStats.pages++;
+          return this.json(`/repos/${full}/actions/workflows/${workflowId}/runs?${q}`);
+        };
+        const days = Math.max(1, Math.ceil((b - a) / DAY_MS));
+        const split = async (parts) => {
+          const bounds = [];
+          for (let i = 0; i < parts; i++) bounds.push(a + Math.floor(days * i / parts) * DAY_MS);
+          bounds.push(b);
+          const pieces = await pool(
+            bounds.slice(0, -1).map((lo, i) => () => this.runsRange(full, workflowId, event, lo, bounds[i + 1], open && i === parts - 1)),
+            3
+          );
+          return { runs: pieces.flatMap((p) => p.runs), complete: new Set(pieces.flatMap((p) => [...p.complete])) };
+        };
+        const p1 = await page(1);
+        const total = p1.total_count ?? p1.workflow_runs.length;
+        if (total >= QUERY_CAP && days > 1) return split(Math.min(days, Math.ceil(total / 800)));
+        const runs = p1.workflow_runs.map(toRun);
+        const pages = Math.min(Math.ceil(total / 100), QUERY_CAP / 100);
+        const rest = await pool(
+          Array.from({ length: Math.max(0, pages - 1) }, (_, i) => () => page(i + 2)),
+          4
+        );
+        for (const r of rest) runs.push(...r.workflow_runs.map(toRun));
+        let last = rest.length ? rest[rest.length - 1].workflow_runs.length : p1.workflow_runs.length;
+        for (let n = Math.max(pages, 1) + 1; last === 100 && n <= QUERY_CAP / 100; n++) {
+          const r = await page(n);
+          runs.push(...r.workflow_runs.map(toRun));
+          last = r.workflow_runs.length;
+        }
+        const capped = total >= QUERY_CAP || runs.length >= QUERY_CAP;
+        if (capped && days > 1) return split(2);
+        const complete = /* @__PURE__ */ new Set();
+        if (!capped) for (let d = a; d < b; d += DAY_MS) complete.add(d);
+        else this.runStats.truncated = true;
+        return { runs, complete };
+      }
       async run(full, runId) {
         return toRun(await this.json(`/repos/${full}/actions/runs/${runId}`));
       }
@@ -8399,9 +8622,9 @@ async function mapPool(items, concurrency, fn) {
   return results;
 }
 async function scanOrg(gh, org, o = {}) {
-  const days = Math.min(90, Math.max(1, o.days ?? 7));
   const now = o.now ?? Date.now();
-  const from = now - days * DAY;
+  const from = o.from ?? now - Math.min(MAX_WINDOW_DAYS, Math.max(1 / 24, o.days ?? 7)) * DAY;
+  const days = Math.round((now - from) / DAY);
   const skipArchived = o.skipArchived !== false;
   const concurrency = o.concurrency ?? 2;
   o.onProgress?.(`listing repos for ${org}`);
@@ -8415,7 +8638,7 @@ async function scanOrg(gh, org, o = {}) {
     o.onProgress?.(`scanning ${i + 1}/${targets.length} ${repo.fullName}`);
     try {
       const snap = await collect(gh, repo.fullName, {
-        days,
+        from,
         now,
         workflows: o.workflows,
         lite: true
@@ -8477,6 +8700,7 @@ var init_org = __esm({
     "use strict";
     init_analyze();
     init_collect();
+    init_window();
     init_github();
   }
 });
@@ -8486,7 +8710,7 @@ var VERSION;
 var init_version = __esm({
   "src/version.ts"() {
     "use strict";
-    VERSION = "0.1.0";
+    VERSION = "0.2.0";
   }
 });
 
@@ -8510,8 +8734,14 @@ async function callTool(name, args, gh) {
   const repo = String(args.repo ?? "").replace(/^https?:\/\/github\.com\//, "").replace(/\/$/, "");
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return { text: "repo must be owner/repo", isError: true };
   if (name === "schedule_report") {
-    const days = Math.min(90, Math.max(1, Number(args.days ?? 7)));
-    const snap = await collect(gh(), repo, { days, workflows: args.workflow ? [String(args.workflow)] : void 0 });
+    let from;
+    try {
+      from = resolveWindow({ days: args.days ?? void 0, since: args.since ? String(args.since) : void 0 }).from;
+    } catch (e) {
+      if (e instanceof WindowError) return { text: e.message.replace(/--(days|since)/g, "$1"), isError: true };
+      throw e;
+    }
+    const snap = await collect(gh(), repo, { from, workflows: args.workflow ? [String(args.workflow)] : void 0 });
     const r = analyze(snap);
     const compact = {
       repo: r.repo,
@@ -8586,6 +8816,7 @@ var init_mcp = __esm({
     init_cron();
     init_format();
     init_version();
+    init_window();
     TOOLS = [
       {
         name: "schedule_report",
@@ -8594,7 +8825,8 @@ var init_mcp = __esm({
           type: "object",
           properties: {
             repo: { type: "string", description: "owner/repo" },
-            days: { type: "number", description: "window in days (default 7, max 90)" },
+            days: { type: "number", description: "window in days (default 7, max 400)" },
+            since: { type: "string", description: "window start instead of days: UTC date '2026-09-01', date-time '2026-09-01T06:00Z', or relative '36h' / '30d' / '6w'" },
             workflow: { type: "string", description: "optional: only this workflow (file name, path, name or id)" }
           },
           required: ["repo"]
@@ -8657,6 +8889,60 @@ function repoFromGit(cwd = process.cwd()) {
 var init_token = __esm({
   "src/token.ts"() {
     "use strict";
+  }
+});
+
+// src/cache.ts
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
+function defaultCacheDir(env = process.env, platform = process.platform) {
+  if (env.CRONLAG_CACHE_DIR) return env.CRONLAG_CACHE_DIR;
+  if (env.XDG_CACHE_HOME) return join(env.XDG_CACHE_HOME, "cronlag");
+  const home = homedir();
+  if (platform === "darwin") return join(home, "Library", "Caches", "cronlag");
+  if (platform === "win32") return join(env.LOCALAPPDATA ?? join(home, "AppData", "Local"), "cronlag", "Cache");
+  return join(home, ".cache", "cronlag");
+}
+function tildify(p) {
+  const home = homedir();
+  return home && p.startsWith(home) ? "~" + p.slice(home.length) : p;
+}
+var SCHEMA, safe, DiskRunCache;
+var init_cache = __esm({
+  "src/cache.ts"() {
+    "use strict";
+    SCHEMA = 1;
+    safe = (part) => part.replace(/[^\w.@-]+/g, "_");
+    DiskRunCache = class {
+      constructor(dir = defaultCacheDir()) {
+        this.dir = dir;
+        this.location = tildify(dir);
+      }
+      location;
+      path(key2) {
+        return join(this.dir, "runs", `v${SCHEMA}`, ...key2.split("/").map(safe)) + ".json";
+      }
+      async get(key2) {
+        try {
+          const data = JSON.parse(await readFile(this.path(key2), "utf8"));
+          if (data?.v !== SCHEMA || !Array.isArray(data.runs)) return void 0;
+          return data.runs;
+        } catch {
+          return void 0;
+        }
+      }
+      async set(key2, runs) {
+        const file = this.path(key2);
+        try {
+          await mkdir(join(file, ".."), { recursive: true, mode: 448 });
+          const tmp = `${file}.${process.pid}.tmp`;
+          await writeFile(tmp, JSON.stringify({ v: SCHEMA, key: key2, runs }), { mode: 384 });
+          await rename(tmp, file);
+        } catch {
+        }
+      }
+    };
   }
 });
 
@@ -8737,8 +9023,10 @@ async function main(argv) {
     return 0;
   }
   const color = !a.flags["no-color"] && !process.env.NO_COLOR && (process.stdout.isTTY || !!process.env.FORCE_COLOR);
+  const useCache = !a.flags["no-cache"] && !/^(1|true|yes)$/i.test(process.env.CRONLAG_NO_CACHE ?? "");
+  const cache = useCache ? new DiskRunCache() : void 0;
   if (a.cmd === "mcp") {
-    await runMcp(() => new GitHub({ token: findToken(one(a, "token")), userAgent: `cronlag/${VERSION}` }));
+    await runMcp(() => new GitHub({ token: findToken(one(a, "token")), userAgent: `cronlag/${VERSION}`, cache }));
     return 0;
   }
   if (a.cmd === "explain") {
@@ -8769,7 +9057,9 @@ async function main(argv) {
     return 0;
   }
   const token = findToken(one(a, "token"));
-  const gh = new GitHub({ token, userAgent: `cronlag/${VERSION}` });
+  const live = a.cmd === "catchup" || a.cmd === "guard";
+  const gh = new GitHub({ token, userAgent: `cronlag/${VERSION}`, cache: live ? void 0 : cache });
+  if (live && (one(a, "since") || one(a, "days"))) throw new UsageError(`${a.cmd} looks at the latest due slots only; --since / --days apply to reports`);
   if (a.cmd === "guard") {
     const repo2 = process.env.GITHUB_REPOSITORY;
     const runId = Number(process.env.GITHUB_RUN_ID);
@@ -8808,15 +9098,33 @@ async function main(argv) {
     out("lag-minutes", g.lagMs === null ? "" : String(Math.round(g.lagMs / MIN)));
     return 0;
   }
-  const days = Math.min(90, Math.max(1, Number(one(a, "days") ?? 7)));
+  let win;
+  try {
+    win = resolveWindow({ days: one(a, "days"), since: one(a, "since") });
+  } catch (e) {
+    if (e instanceof WindowError) throw new UsageError(e.message);
+    throw e;
+  }
   const t = thresholds(a);
-  if (!token && process.stderr.isTTY) console.error("(no GitHub token found \u2014 public repos only, 60 API calls/hour)");
+  if (!token && process.stderr.isTTY) {
+    console.error(
+      win.days > 30 ? `(no GitHub token found \u2014 public repos only, 60 API calls/hour; a ${Math.round(win.days)}-day window can need more on the first run)` : "(no GitHub token found \u2014 public repos only, 60 API calls/hour)"
+    );
+  }
+  const runNote = () => {
+    const st = gh.runStats;
+    if (st.truncated) console.error("cronlag: warning \u2014 a single day had more than 1000 runs of one workflow; GitHub's API returns at most 1000, so some runs (and lag numbers) are missing");
+    if (!process.stderr.isTTY || !st.days) return;
+    const note = (msg) => console.error(color ? `\x1B[2m${msg}\x1B[0m` : msg);
+    if (st.cachedDays) note(`(cached: ${st.cachedDays} of ${st.days} days of runs from ${gh.cacheLocation} \xB7 ${st.pages} API request${st.pages === 1 ? "" : "s"} for the rest)`);
+    else if (win.days > 7 && cache) note(`(${st.pages} API requests for runs; finished days are now cached in ${gh.cacheLocation}, so the next run reuses them)`);
+  };
   const orgName = a.cmd === "org" ? a.pos[0] : one(a, "org");
   if (a.cmd === "org" || orgName) {
     if (!orgName) throw new UsageError("org needs a name, e.g. cronlag org github");
     const progress = process.stderr.isTTY ? (msg) => console.error(msg) : void 0;
     const report2 = await scanOrg(gh, orgName, {
-      days,
+      from: win.from,
       workflows: a.flags.workflow,
       thresholds: t,
       onProgress: progress
@@ -8825,6 +9133,7 @@ async function main(argv) {
     if (format2 === "json") console.log(JSON.stringify(report2, null, 2));
     else if (format2 === "markdown" || format2 === "md") console.log(formatOrgMarkdown(report2));
     else console.log(formatOrgText(report2, { color, width: process.stdout.columns }));
+    runNote();
     return exitForOrg(report2, one(a, "fail-on") ?? "never");
   }
   const repo = resolveRepo(a);
@@ -8845,12 +9154,13 @@ async function main(argv) {
     }
     return 0;
   }
-  const snap = await collect(gh, repo, { days, workflows: a.flags.workflow, lite: !!a.flags.lite });
+  const snap = await collect(gh, repo, { from: win.from, workflows: a.flags.workflow, lite: !!a.flags.lite });
   const report = analyze(snap, t);
   const format = one(a, "format") ?? (a.flags.json ? "json" : "text");
   if (format === "json") console.log(JSON.stringify(report, null, 2));
   else if (format === "markdown" || format === "md") console.log(formatMarkdown(report));
   else console.log(formatText(report, { color, width: process.stdout.columns }));
+  runNote();
   return exitFor(report, one(a, "fail-on") ?? "never");
 }
 function isEntryPoint() {
@@ -8879,6 +9189,8 @@ var init_cli = __esm({
     init_mcp();
     init_token();
     init_version();
+    init_cache();
+    init_window();
     init_workflow();
     HELP = `cronlag ${VERSION} \u2014 is your scheduled GitHub Actions workflow late, dropped, or broken?
 
@@ -8894,7 +9206,10 @@ Usage
   cronlag mcp                             MCP server on stdio (read-only tools)
 
 Options
-  -d, --days <n>          window to inspect (default 7, max 90)
+  -d, --days <n>          window to inspect (default 7, max ${MAX_WINDOW_DAYS})
+  -s, --since <when>      window start instead of --days: 2026-09-01, 2026-09-01T06:00Z (UTC),
+                          or relative 36h / 30d / 6w
+      --no-cache          don't read or write the run cache (always refetch from the API)
   -w, --workflow <x>      only this workflow (file, path, name or id); repeatable
   -f, --format <fmt>      text | json | markdown (default text)
       --org <org>         org-wide scan (same as \`cronlag org <org>\`)
@@ -8906,29 +9221,33 @@ Options
   -h, --help / -v, --version
 
 Public repos work without a token (60 API calls/hour); private repos need actions:read.
+Run cache: settled days of runs are kept in ${tildify(defaultCacheDir())} (CRONLAG_CACHE_DIR to move it),
+so a second long-window report only fetches the last day or so.
 Org scan skips archived repos and uses --lite for fewer API calls. catchup --dispatch needs actions:write.
 Docs: https://blackman99.github.io/cronlag/docs/`;
-    SHORT = { d: "days", w: "workflow", f: "format", h: "help", v: "version", n: "count" };
-    BOOL = /* @__PURE__ */ new Set(["help", "version", "no-color", "dispatch", "lite", "json"]);
-    VALUED = /* @__PURE__ */ new Set(["days", "workflow", "format", "count", "fail-on", "late", "on-time", "token", "grace", "tz", "cron", "org"]);
+    SHORT = { s: "since", d: "days", w: "workflow", f: "format", h: "help", v: "version", n: "count" };
+    BOOL = /* @__PURE__ */ new Set(["help", "version", "no-color", "no-cache", "dispatch", "lite", "json"]);
+    VALUED = /* @__PURE__ */ new Set(["days", "since", "workflow", "format", "count", "fail-on", "late", "on-time", "token", "grace", "tz", "cron", "org"]);
     UsageError = class extends Error {
     };
     isDirect = isEntryPoint();
     if (isDirect) {
       main(process.argv.slice(2)).then(
-        (code) => process.exit(code),
+        (code) => {
+          process.exitCode = code;
+        },
         (e) => {
           if (e instanceof UsageError) {
             console.error(`cronlag: ${e.message}
 Run \`cronlag --help\` for usage.`);
-            process.exit(2);
-          }
-          if (e instanceof GitHubError) {
+            process.exitCode = 2;
+          } else if (e instanceof GitHubError) {
             console.error(`cronlag: ${e.message}`);
-            process.exit(3);
+            process.exitCode = 3;
+          } else {
+            console.error(e);
+            process.exitCode = 3;
           }
-          console.error(e);
-          process.exit(3);
         }
       );
     }
@@ -8940,6 +9259,7 @@ init_analyze();
 init_collect();
 init_format();
 init_github();
+init_window();
 import { appendFileSync as appendFileSync2 } from "node:fs";
 var input = (k, d = "") => (process.env[`INPUT_${k.replace(/ /g, "_").toUpperCase()}`] ?? d).trim() || d;
 var setOut = (k, v) => process.env.GITHUB_OUTPUT && appendFileSync2(process.env.GITHUB_OUTPUT, `${k}=${v}
@@ -8954,11 +9274,12 @@ async function main2() {
     return;
   }
   const repo = input("repo") || process.env.GITHUB_REPOSITORY || "";
-  const days = Number(input("days", "7"));
+  const since = input("since");
+  const win = resolveWindow(since ? { since } : { days: input("days", "7") });
   const wf = input("workflow");
   const failOn = input("fail-on", "never");
   const gh = new GitHub({ token: token || void 0, userAgent: "cronlag-action" });
-  const snap = await collect(gh, repo, { days, workflows: wf ? wf.split(/[,\n]/).map((s) => s.trim()).filter(Boolean) : void 0 });
+  const snap = await collect(gh, repo, { from: win.from, workflows: wf ? wf.split(/[,\n]/).map((s) => s.trim()).filter(Boolean) : void 0 });
   const r = analyze(snap);
   console.log(formatText(r, { color: true, width: 110 }));
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync2(process.env.GITHUB_STEP_SUMMARY, formatMarkdown(r) + "\n");

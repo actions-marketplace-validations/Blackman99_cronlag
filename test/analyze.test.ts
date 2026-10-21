@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { analyze, attribute, DEFAULTS, guard, planCatchup, HOUR, MIN, DAY, type Snapshot } from "../src/analyze.ts";
+import { analyze, attribute, offMinute, DEFAULTS, guard, planCatchup, HOUR, MIN, DAY, type Snapshot } from "../src/analyze.ts";
 import { parseCron } from "../src/cron.ts";
 import type { Run } from "../src/github.ts";
 import { formatMarkdown, formatText } from "../src/format.ts";
@@ -133,6 +133,30 @@ test("disabled_inactivity is reported with the enable command", () => {
   const w = analyze(synth({ state: "disabled_inactivity" })).workflows[0];
   assert.equal(w.verdict, "DISABLED");
   assert.match(w.findings[0].fix ?? "", /gh workflow enable nightly\.yml -R o\/r/);
+});
+
+test("a manually disabled workflow is DISABLED without 'not registered' or 'overdue' noise (community #210622)", () => {
+  const w = analyze(synth({ state: "disabled_manually", fileChangedAt: Date.parse("2026-10-10T12:00:00Z") })).workflows[0];
+  assert.equal(w.verdict, "DISABLED");
+  assert.equal(w.headline, "workflow state is disabled_manually");
+  const codes = w.findings.map((f) => f.code);
+  assert.ok(codes.includes("disabled"));
+  assert.ok(!codes.includes("not-registered"));
+});
+
+test("minute-0 fix keeps the schedule's frequency (every 5 min stays every 5 min)", () => {
+  const fix = (cron: string) => offMinute(parseCron(cron).minutes, 3);
+  assert.equal(fix("0 6 * * *"), "23");
+  assert.equal(fix("0-59/5 * * * *"), "4-59/5");
+  assert.equal(fix("*/15 * * * *"), "4-59/15");
+  assert.equal(fix("0,30 * * * *"), "7,37");
+  assert.equal(fix("0,10,45 * * * *"), "7,17,52");
+  for (const c of ["*/5 * * * *", "0,30 * * * *", "0,10,45 * * * *", "*/2 * * * *", "0 6 * * *"]) {
+    const before = parseCron(c).minutes.length;
+    const after = parseCron(`${fix(c)} * * * *`).minutes;
+    assert.equal(after.length, before, c);
+    assert.ok(!after.includes(0), c);
+  }
 });
 
 test("too-frequent cron and no workflow_dispatch", () => {

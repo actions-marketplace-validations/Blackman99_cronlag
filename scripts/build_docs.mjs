@@ -36,7 +36,7 @@ npm install -g ./cronlag-0.1.0.tgz             # from the release tarball</code>
 <h2>Tokens</h2>
 <p>cronlag looks for a token in <code>--token</code>, then <code>GITHUB_TOKEN</code>, then <code>GH_TOKEN</code>, then <code>gh auth token</code>.</p>
 <table><tr><th>What</th><th>Needs</th></tr>
-<tr><td>Report on a public repo</td><td>nothing (60 API calls/hour unauthenticated; a report uses about 2 + 3 per scheduled workflow)</td></tr>
+<tr><td>Report on a public repo</td><td>nothing (60 API calls/hour unauthenticated; a 7-day report uses about 2 + 3 per scheduled workflow; a first <code>--since 90d</code> on an hourly workflow about 25 more, a repeat one almost none)</td></tr>
 <tr><td>Report on a private repo</td><td>fine-grained token with <b>Actions: read</b> and <b>Contents: read</b>, or classic <code>repo</code></td></tr>
 <tr><td><code>catchup --dispatch</code></td><td><b>Actions: write</b></td></tr>
 <tr><td>GitHub Action</td><td>the job's <code>GITHUB_TOKEN</code> with <code>actions: read</code> (default for most repos)</td></tr></table>`,
@@ -46,10 +46,23 @@ usage: `
 cronlag owner/repo --days 14
 cronlag owner/repo -w nightly.yml -f markdown   # paste into an issue</code></pre>
 <p>One block per scheduled workflow: the cron line(s), a strip with one glyph per slot (bar height = lag, <code>✕</code> = no run, <code>?</code> = no run yet), lag min/median/p90/max, on-time and within-1-hour counts, a verdict, and the cause checks with the fix to apply.</p>
+<h2 id="since">Longer windows: --since and the run cache</h2>
+<pre><code>cronlag owner/repo --since 2026-08-15          # since a UTC date: before vs. during the incident
+cronlag owner/repo --since 2026-08-15T06:00Z   # or a date-time (no zone = UTC)
+cronlag owner/repo --since 90d                 # relative: 36h, 30d, 6w
+cronlag org my-org --since 30d -f markdown</code></pre>
+<p><code>--since</code> replaces <code>--days</code> (giving both is an error); either one goes up to <b>400 days</b>. Every run in the window is read: the window is split into UTC days and fetched as a few <code>created=</code> range queries, halved automatically wherever one would pass the API's 1000-result cap, so an every-5-minutes schedule over a year is complete too. Past about 3 lines the slot strip folds several consecutive slots into one mark, and the line under it says how many: <code>✕</code> when none of them ran, a small <code>x</code> when some ran and some didn't (a schedule GitHub is thinning out), otherwise the bar of the worst lag.</p>
+<p><b>Run cache.</b> A workflow run's creation time never changes, so a UTC day that ended more than 6 hours ago and whose runs have all completed is final. cronlag keeps such days on disk, one small JSON file per repo + workflow + event + day, and the next report only asks the API for today, the last day or two and any day that still had a queued or running run. The second <code>--since 90d</code> on the same repo costs about as much as a 2-day report.</p>
+<table><tr><th>Where</th><th>Path</th></tr>
+<tr><td>Linux</td><td><code>$XDG_CACHE_HOME/cronlag</code> or <code>~/.cache/cronlag</code></td></tr>
+<tr><td>macOS</td><td><code>~/Library/Caches/cronlag</code></td></tr>
+<tr><td>Windows</td><td><code>%LOCALAPPDATA%\\cronlag\\Cache</code></td></tr>
+<tr><td>anywhere</td><td><code>CRONLAG_CACHE_DIR</code> overrides</td></tr></table>
+<p><code>--no-cache</code> (or <code>CRONLAG_NO_CACHE=1</code>) skips reading and writing it. Deleting the directory is always safe. It holds run ids, numbers, URLs, status and timestamps (no tokens, no logs), in files only your user can read. <code>catchup</code> and <code>guard</code> never use the cache: they decide what to dispatch or skip from the API's answer right now. The GitHub Action doesn't cache either (each job starts on a fresh runner). A run that is re-run later keeps its first attempt in the cache.</p>
 <h2 id="org">Org-wide scan</h2>
 <pre><code>cronlag org my-org
 cronlag --org my-org --days 14 --fail-on late
-cronlag org my-org -f markdown</code></pre>
+cronlag org my-org --since 2026-09-01 -f markdown</code></pre>
 <p>Lists every non-archived repo in the org, finds those with <code>on: schedule</code> workflows, runs the same report pipeline on each (in <code>--lite</code> mode for fewer API calls), and prints a compact summary sorted <b>worst first</b>. Text, JSON and Markdown are supported; <code>--fail-on</code> exits 1 if any scanned repo hits the threshold. Progress goes to stderr when the terminal is a TTY. Archived repos are skipped; non-archived forks are still scanned (the fork cause check explains why schedules never fire).</p>
 <h2 id="catchup">Catch-up</h2>
 <pre><code>cronlag catchup owner/repo              # dry run: what would be dispatched
@@ -90,7 +103,7 @@ jobs:
     steps:
       - uses: Blackman99/cronlag@v0
         with:
-          days: 7
+          days: 7            # or since: 2026-09-01 / since: 30d
           fail-on: dropped</code></pre>
 <p>Writes the Markdown report to the job summary and sets outputs <code>verdict</code>, <code>missed</code>, <code>median-lag-minutes</code>, <code>json</code>.</p>
 <h2 id="mcp">MCP server</h2>
@@ -99,11 +112,13 @@ jobs:
     "cronlag": { "command": "npx", "args": ["-y", "github:Blackman99/cronlag", "mcp"], "env": { "GITHUB_TOKEN": "…" } }
   }
 }</code></pre>
-<p>Tools (all read-only): <code>schedule_report</code> {repo, days?, workflow?}, <code>catchup_plan</code> {repo, grace_minutes?}, <code>cron_explain</code> {cron, timezone?, count?}. The plan never dispatches; an agent that should act runs <code>cronlag catchup --dispatch</code> itself, under whatever approval you require.</p>`,
+<p>Tools (all read-only): <code>schedule_report</code> {repo, days?, since?, workflow?}, <code>catchup_plan</code> {repo, grace_minutes?}, <code>cron_explain</code> {cron, timezone?, count?}. The plan never dispatches; an agent that should act runs <code>cronlag catchup --dispatch</code> itself, under whatever approval you require.</p>`,
 configuration: `
 <h2>CLI flags</h2>
 <table><tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
-<tr><td><code>-d, --days</code></td><td>7</td><td>window to inspect (1–90)</td></tr>
+<tr><td><code>-d, --days</code></td><td>7</td><td>window to inspect, up to 400 days (fractions work: <code>0.5</code>)</td></tr>
+<tr><td><code>-s, --since</code></td><td></td><td>window start instead of <code>--days</code>: <code>2026-09-01</code>, <code>2026-09-01T06:00Z</code> (UTC unless an offset is given) or relative <code>36h</code> / <code>30d</code> / <code>6w</code>; at least 1h, at most 400 days</td></tr>
+<tr><td><code>--no-cache</code></td><td>off</td><td>don't read or write the <a href="usage.html#since">run cache</a></td></tr>
 <tr><td><code>-w, --workflow</code></td><td>all</td><td>only this workflow: file name (<code>nightly.yml</code> or <code>nightly</code>), path, display name or id; repeatable</td></tr>
 <tr><td><code>-f, --format</code></td><td>text</td><td><code>text</code>, <code>json</code>, <code>markdown</code></td></tr>
 <tr><td><code>--org</code></td><td></td><td>org-wide scan (same as <code>cronlag org &lt;org&gt;</code>)</td></tr>
@@ -121,7 +136,8 @@ configuration: `
 <table><tr><th>Input</th><th>Default</th><th></th></tr>
 <tr><td><code>mode</code></td><td>report</td><td><code>report</code> or <code>guard</code></td></tr>
 <tr><td><code>repo</code></td><td>this repo</td><td>owner/repo</td></tr>
-<tr><td><code>days</code></td><td>7</td><td>report window</td></tr>
+<tr><td><code>days</code></td><td>7</td><td>report window, up to 400</td></tr>
+<tr><td><code>since</code></td><td></td><td>window start instead of <code>days</code> (same forms as <code>--since</code>); overrides <code>days</code></td></tr>
 <tr><td><code>workflow</code></td><td></td><td>comma-separated file names</td></tr>
 <tr><td><code>fail-on</code></td><td>never</td><td>as the CLI flag</td></tr>
 <tr><td><code>token</code></td><td><code>github.token</code></td><td>needs actions:read</td></tr></table>
@@ -166,7 +182,7 @@ reference: `
   "unscheduled": [ "ci.yml", … ] }</code></pre>
 <p>Times are epoch milliseconds in <code>slots</code>, ISO strings at the top level. Durations are milliseconds.</p>
 <h2>Exit codes</h2>
-<p><code>0</code> ok (or nothing matched <code>--fail-on</code>) · <code>1</code> a workflow matched <code>--fail-on</code> · <code>2</code> usage error (including an unknown option) / invalid cron · <code>3</code> GitHub API error (rate limit, not found, auth).</p>
+<p><code>0</code> ok (or nothing matched <code>--fail-on</code>) · <code>1</code> a workflow matched <code>--fail-on</code> · <code>2</code> usage error (an unknown option, a bad <code>--since</code> / <code>--days</code>) / invalid cron · <code>3</code> GitHub API error (rate limit, not found, auth).</p>
 <h2>MCP tools</h2>
 <p><code>schedule_report</code> returns the Markdown report plus compact JSON; <code>catchup_plan</code> returns the steps <code>catchup</code> would take (never dispatches); <code>cron_explain</code> returns next fire times, shortest interval and the minute-0 flag. All are annotated <code>readOnlyHint: true</code>.</p>`,
 faq: `
@@ -177,7 +193,7 @@ faq: `
 <h2>Will catch-up cause double runs?</h2>
 <p>Catch-up only dispatches a slot that has no run after the grace period, and never the same slot twice. If GitHub's delayed run arrives later anyway, add the guard job and it will skip. Without the guard, make the job idempotent (most refresh jobs already are) or use a <code>concurrency</code> group.</p>
 <h2>Does moving off minute 0 help?</h2>
-<p>Sometimes. GitHub recommends it, and cronlag suggests a quieter minute. But the 2026 threads show off-peak schedules (:15, :23, :38, :47) failing too, so measure before and after with <code>cronlag --days 14</code>.</p>
+<p>Sometimes. GitHub recommends it, and cronlag suggests a quieter minute. But the 2026 threads show off-peak schedules (:15, :23, :38, :47) failing too, so measure before and after with <code>cronlag --since</code> the day you moved it.</p>
 <h2>Private repos? GitHub Enterprise?</h2>
 <p>Private repos work with a token that has Actions: read. GHES: point the library's <code>GitHub</code> client at your API base (<code>apiBase</code>); a CLI flag is on the roadmap.</p>
 <h2>Is anything sent anywhere?</h2>

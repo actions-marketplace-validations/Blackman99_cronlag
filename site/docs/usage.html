@@ -13,10 +13,23 @@
 cronlag owner/repo --days 14
 cronlag owner/repo -w nightly.yml -f markdown   # paste into an issue</code></pre>
 <p>One block per scheduled workflow: the cron line(s), a strip with one glyph per slot (bar height = lag, <code>✕</code> = no run, <code>?</code> = no run yet), lag min/median/p90/max, on-time and within-1-hour counts, a verdict, and the cause checks with the fix to apply.</p>
+<h2 id="since">Longer windows: --since and the run cache</h2>
+<pre><code>cronlag owner/repo --since 2026-08-15          # since a UTC date: before vs. during the incident
+cronlag owner/repo --since 2026-08-15T06:00Z   # or a date-time (no zone = UTC)
+cronlag owner/repo --since 90d                 # relative: 36h, 30d, 6w
+cronlag org my-org --since 30d -f markdown</code></pre>
+<p><code>--since</code> replaces <code>--days</code> (giving both is an error); either one goes up to <b>400 days</b>. Every run in the window is read: the window is split into UTC days and fetched as a few <code>created=</code> range queries, halved automatically wherever one would pass the API's 1000-result cap, so an every-5-minutes schedule over a year is complete too. Past about 3 lines the slot strip folds several consecutive slots into one mark, and the line under it says how many: <code>✕</code> when none of them ran, a small <code>x</code> when some ran and some didn't (a schedule GitHub is thinning out), otherwise the bar of the worst lag.</p>
+<p><b>Run cache.</b> A workflow run's creation time never changes, so a UTC day that ended more than 6 hours ago and whose runs have all completed is final. cronlag keeps such days on disk, one small JSON file per repo + workflow + event + day, and the next report only asks the API for today, the last day or two and any day that still had a queued or running run. The second <code>--since 90d</code> on the same repo costs about as much as a 2-day report.</p>
+<table><tr><th>Where</th><th>Path</th></tr>
+<tr><td>Linux</td><td><code>$XDG_CACHE_HOME/cronlag</code> or <code>~/.cache/cronlag</code></td></tr>
+<tr><td>macOS</td><td><code>~/Library/Caches/cronlag</code></td></tr>
+<tr><td>Windows</td><td><code>%LOCALAPPDATA%\cronlag\Cache</code></td></tr>
+<tr><td>anywhere</td><td><code>CRONLAG_CACHE_DIR</code> overrides</td></tr></table>
+<p><code>--no-cache</code> (or <code>CRONLAG_NO_CACHE=1</code>) skips reading and writing it. Deleting the directory is always safe. It holds run ids, numbers, URLs, status and timestamps (no tokens, no logs), in files only your user can read. <code>catchup</code> and <code>guard</code> never use the cache: they decide what to dispatch or skip from the API's answer right now. The GitHub Action doesn't cache either (each job starts on a fresh runner). A run that is re-run later keeps its first attempt in the cache.</p>
 <h2 id="org">Org-wide scan</h2>
 <pre><code>cronlag org my-org
 cronlag --org my-org --days 14 --fail-on late
-cronlag org my-org -f markdown</code></pre>
+cronlag org my-org --since 2026-09-01 -f markdown</code></pre>
 <p>Lists every non-archived repo in the org, finds those with <code>on: schedule</code> workflows, runs the same report pipeline on each (in <code>--lite</code> mode for fewer API calls), and prints a compact summary sorted <b>worst first</b>. Text, JSON and Markdown are supported; <code>--fail-on</code> exits 1 if any scanned repo hits the threshold. Progress goes to stderr when the terminal is a TTY. Archived repos are skipped; non-archived forks are still scanned (the fork cause check explains why schedules never fire).</p>
 <h2 id="catchup">Catch-up</h2>
 <pre><code>cronlag catchup owner/repo              # dry run: what would be dispatched
@@ -57,7 +70,7 @@ jobs:
     steps:
       - uses: Blackman99/cronlag@v0
         with:
-          days: 7
+          days: 7            # or since: 2026-09-01 / since: 30d
           fail-on: dropped</code></pre>
 <p>Writes the Markdown report to the job summary and sets outputs <code>verdict</code>, <code>missed</code>, <code>median-lag-minutes</code>, <code>json</code>.</p>
 <h2 id="mcp">MCP server</h2>
@@ -66,6 +79,6 @@ jobs:
     "cronlag": { "command": "npx", "args": ["-y", "github:Blackman99/cronlag", "mcp"], "env": { "GITHUB_TOKEN": "…" } }
   }
 }</code></pre>
-<p>Tools (all read-only): <code>schedule_report</code> {repo, days?, workflow?}, <code>catchup_plan</code> {repo, grace_minutes?}, <code>cron_explain</code> {cron, timezone?, count?}. The plan never dispatches; an agent that should act runs <code>cronlag catchup --dispatch</code> itself, under whatever approval you require.</p></main>
+<p>Tools (all read-only): <code>schedule_report</code> {repo, days?, since?, workflow?}, <code>catchup_plan</code> {repo, grace_minutes?}, <code>cron_explain</code> {cron, timezone?, count?}. The plan never dispatches; an agent that should act runs <code>cronlag catchup --dispatch</code> itself, under whatever approval you require.</p></main>
 <footer class="dfoot"><a href="https://github.com/Blackman99/cronlag">GitHub</a> · <a href="https://github.com/Blackman99/cronlag/issues">Issues</a> · MIT</footer>
 </body></html>
