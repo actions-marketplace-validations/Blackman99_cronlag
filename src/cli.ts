@@ -1,7 +1,8 @@
-import { analyze, DAY, DEFAULTS, fmtDur, guard, HOUR, MIN, planCatchup, type Report, type Thresholds } from "./analyze.js";
+import { analyze, DAY, DEFAULTS, fmtDur, guard, HOUR, MIN, type Report, type Thresholds } from "./analyze.js";
 import { collect } from "./collect.js";
+import { runCatchup } from "./catchup.js";
 import { CronError, nextFires, parseCron, minInterval } from "./cron.js";
-import { formatCatchup, formatMarkdown, formatOrgMarkdown, formatOrgText, formatText } from "./format.js";
+import { formatCatchup, formatMarkdown, formatOrgMarkdown, formatOrgText, formatText, wrap } from "./format.js";
 import { exitForOrg, scanOrg } from "./org.js";
 import { GitHub, GitHubError } from "./github.js";
 import { runMcp } from "./mcp.js";
@@ -10,9 +11,10 @@ import { VERSION } from "./version.js";
 import { DiskRunCache, defaultCacheDir, tildify } from "./cache.js";
 import { MAX_WINDOW_DAYS, resolveWindow, WindowError } from "./window.js";
 import { readTriggers } from "./workflow.js";
-import { appendFileSync, realpathSync } from "node:fs";
+import { appendFileSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { DEFAULT_BIN, notes, render, selectWorkflows, slug, TARGETS, tickFor, WorkerSpecError, type Selection, type Target, type WorkerSpec } from "./worker.js";
 import { fileURLToPath } from "node:url";
-import { resolve as resolvePath } from "node:path";
+import { join, resolve as resolvePath } from "node:path";
 
 const HELP = `cronlag ${VERSION} — is your scheduled GitHub Actions workflow late, dropped, or broken?
 
@@ -25,6 +27,8 @@ Usage
   cronlag guard                           inside a scheduled run: skip=true if catch-up already ran this slot
   cronlag explain "<cron>" [--tz Zone] [-n 5]
                                           next fire times, interval, busy-minute check
+  cronlag worker [owner/repo] [--target cloudflare|systemd|crontab] [--every 10m] [--grace 15m] [-o dir]
+                                          print a ready-made external scheduler that runs catchup --dispatch
   cronlag mcp                             MCP server on stdio (read-only tools)
 
 Options
@@ -38,6 +42,10 @@ Options
       --fail-on <level>   never | dropped | late   exit 1 when a workflow is that bad (default never)
       --late <dur>        lag that counts as "very late" (default 1h)
       --on-time <dur>     lag still counted as on time (default 10m)
+  -t, --target <t>        worker: cloudflare (default) | systemd | crontab
+      --every <dur>       worker: how often the scheduler runs a catch-up pass (default 10m)
+  -o, --out <dir>         worker: write the files into <dir> instead of printing them
+      --bin <cmd>         worker (systemd/crontab): command that runs cronlag (default npx -y github:Blackman99/cronlag#v0)
       --token <t>         GitHub token (default: $GITHUB_TOKEN, $GH_TOKEN, then \`gh auth token\`)
       --no-color          plain output
   -h, --help / -v, --version
@@ -54,9 +62,9 @@ interface Args {
   flags: Record<string, string[]>;
 }
 
-const SHORT: Record<string, string> = { s: "since", d: "days", w: "workflow", f: "format", h: "help", v: "version", n: "count" };
+const SHORT: Record<string, string> = { t: "target", o: "out", s: "since", d: "days", w: "workflow", f: "format", h: "help", v: "version", n: "count" };
 const BOOL = new Set(["help", "version", "no-color", "no-cache", "dispatch", "lite", "json"]);
-const VALUED = new Set(["days", "since", "workflow", "format", "count", "fail-on", "late", "on-time", "token", "grace", "tz", "cron", "org"]);
+const VALUED = new Set(["days", "since", "workflow", "format", "count", "fail-on", "late", "on-time", "token", "grace", "tz", "cron", "org", "target", "every", "out", "bin"]);
 
 export function parseArgs(argv: string[]): Args {
   const flags: Record<string, string[]> = {};
@@ -81,7 +89,7 @@ export function parseArgs(argv: string[]): Args {
       (flags[k] ??= []).push(v);
     } else pos.push(a);
   }
-  const cmds = ["catchup", "guard", "explain", "mcp", "org", "report"];
+  const cmds = ["catchup", "guard", "explain", "mcp", "org", "report", "worker"];
   const cmd = pos.length && cmds.includes(pos[0]) ? (pos.shift() as string) : "report";
   return { cmd, pos, flags };
 }
@@ -170,6 +178,8 @@ async function main(argv: string[]): Promise<number> {
     if (c.minutes.includes(0)) console.log("  ! minute 0 is GitHub's busiest minute; pick another (e.g. 7 or 43)");
     return 0;
   }
+
+  if (a.cmd === "worker") return await workerCmd(a);
 
   const token = findToken(one(a, "token"));
   // catchup and guard decide what to dispatch/skip right now: always read the API directly.
@@ -261,21 +271,13 @@ async function main(argv: string[]): Promise<number> {
   const repo = resolveRepo(a);
 
   if (a.cmd === "catchup") {
-    const grace = parseDur(one(a, "grace") ?? "15m");
-    const snap = await collect(gh, repo, { days: 2, workflows: a.flags.workflow, lite: true });
-    const steps = planCatchup(snap, grace, t);
-    const doIt = !!a.flags.dispatch;
-    if (doIt) {
-      for (const s of steps.filter((x) => x.action === "dispatch")) {
-        await gh.dispatch(snap.repo.fullName, s.id, snap.repo.defaultBranch);
-      }
-    }
-    if (one(a, "format") === "json") console.log(JSON.stringify({ repo: snap.repo.fullName, dispatched: doIt, steps }, null, 2));
+    const r = await runCatchup(gh, repo, { workflows: a.flags.workflow, graceMs: parseDur(one(a, "grace") ?? "15m"), dispatch: !!a.flags.dispatch, thresholds: t });
+    if (one(a, "format") === "json") console.log(JSON.stringify(r, null, 2));
     else {
-      console.log(formatCatchup(steps, doIt, color));
-      if (!doIt && steps.some((s) => s.action === "dispatch")) console.log("\n(dry run — add --dispatch to run the slots above via workflow_dispatch)");
+      console.log(formatCatchup(r.steps, r.dispatched, color));
+      if (!r.dispatched && r.steps.some((s) => s.action === "dispatch")) console.log("\n(dry run — add --dispatch to run the slots above via workflow_dispatch)");
     }
-    return 0;
+    return r.steps.some((s) => s.error) ? 3 : 0;
   }
 
   const snap = await collect(gh, repo, { from: win.from, workflows: a.flags.workflow, lite: !!a.flags.lite });
@@ -286,6 +288,120 @@ async function main(argv: string[]): Promise<number> {
   else console.log(formatText(report, { color, width: process.stdout.columns }));
   runNote();
   return exitFor(report, one(a, "fail-on") ?? "never");
+}
+
+async function workerCmd(a: Args): Promise<number> {
+  for (const k of ["since", "days", "dispatch"]) {
+    if (a.flags[k]) throw new UsageError(k === "dispatch" ? "worker always prints a recipe that dispatches; each one explains its dry run" : `worker runs catch-up on the latest due slots only; --${k} applies to reports`);
+  }
+  const target = (one(a, "target") ?? "cloudflare").toLowerCase();
+  if (!(TARGETS as readonly string[]).includes(target)) throw new UsageError(`--target must be one of ${TARGETS.join(", ")} (got "${target}")`);
+  const graceMs = parseDur(one(a, "grace") ?? "15m");
+  if (graceMs < MIN || graceMs >= DAY) throw new UsageError("--grace must be between 1m and 24h (catch-up only looks at slots from the last 24h)");
+  let tick;
+  try {
+    tick = tickFor(parseDur(one(a, "every") ?? "10m"));
+  } catch (e) {
+    if (e instanceof WorkerSpecError) throw new UsageError(e.message);
+    throw e;
+  }
+  const bin = one(a, "bin") ?? DEFAULT_BIN;
+  if (target === "cloudflare" && one(a, "bin")) throw new UsageError("--bin is for systemd and crontab; the Cloudflare Worker carries its own copy of cronlag");
+  const format = one(a, "format") ?? "text";
+  if (!["text", "json"].includes(format)) throw new UsageError("worker prints text or --format json");
+  const repo = resolveRepo(a);
+  const gh = new GitHub({ token: findToken(one(a, "token")), userAgent: `cronlag/${VERSION}` });
+  let sel;
+  try {
+    sel = await selectWorkflows(gh, repo, a.flags.workflow);
+  } catch (e) {
+    if (e instanceof WorkerSpecError) throw new UsageError(e.message);
+    throw e;
+  }
+  if (a.flags.workflow?.length && sel.noDispatch.length) {
+    throw new UsageError(`${sel.noDispatch.map((w) => w.file).join(", ")} ha${sel.noDispatch.length === 1 ? "s" : "ve"} no workflow_dispatch trigger, so catch-up can't start ${sel.noDispatch.length === 1 ? "it" : "them"}; add \`workflow_dispatch:\` under \`on:\` first`);
+  }
+  if (!sel.workflows.length) {
+    throw new UsageError(
+      sel.noDispatch.length
+        ? `${sel.repo}: no scheduled workflow has a workflow_dispatch trigger (${sel.noDispatch.map((w) => w.file).join(", ")}); add \`workflow_dispatch:\` under \`on:\` so catch-up can start them`
+        : `${sel.repo} has no workflows with on: schedule, so there is nothing to catch up`,
+    );
+  }
+  const spec: WorkerSpec = { repo: sel.repo, target: target as Target, workflows: sel.workflows, graceMs, tick, bin, generated: new Date().toISOString().slice(0, 10) };
+  const files = render(spec);
+  const outDir = one(a, "out");
+  if (format === "json") {
+    if (outDir) throw new UsageError("--out writes files; leave it out with --format json");
+    console.log(JSON.stringify({ repo: spec.repo, target, every: tick.label, cron: tick.cron, onCalendar: tick.onCalendar, graceMinutes: graceMs / MIN, workflows: spec.workflows, notes: notes(spec, sel), files }, null, 2));
+    return 0;
+  }
+  const errColor = !a.flags["no-color"] && !process.env.NO_COLOR && (process.stderr.isTTY || !!process.env.FORCE_COLOR);
+  if (outDir) {
+    mkdirSync(outDir, { recursive: true });
+    const wrote: string[] = [];
+    for (const f of files) {
+      const p = join(outDir, f.name);
+      writeFileSync(p, f.text);
+      wrote.push(`${p}  (${f.text.length >= 10_000 ? `${Math.round(f.text.length / 1024)} KB` : `${f.text.split("\n").length} lines`})`);
+    }
+    console.log(workerSummary(spec, sel, { color: !a.flags["no-color"] && !process.env.NO_COLOR && (process.stdout.isTTY || !!process.env.FORCE_COLOR), wrote, outDir }));
+    return 0;
+  }
+  if (target === "systemd") {
+    console.log(files.map((f) => `# ===== /etc/systemd/system/${f.name} =====\n${f.text}`).join("\n"));
+  } else {
+    process.stdout.write(files[0].text.endsWith("\n") ? files[0].text : files[0].text + "\n");
+  }
+  console.error("\n" + workerSummary(spec, sel, { color: errColor }));
+  return 0;
+}
+
+function workerSummary(spec: WorkerSpec, sel: Selection, o: { color: boolean; wrote?: string[]; outDir?: string }): string {
+  const C = { dim: "\x1b[2m", bold: "\x1b[1m", green: "\x1b[32m", yellow: "\x1b[33m", cyan: "\x1b[36m", reset: "\x1b[0m" };
+  const c = (k: keyof typeof C, s: string) => (o.color ? C[k] + s + C.reset : s);
+  const width = Math.max(60, Math.min(process.stderr.columns || 100, 120));
+  const what = spec.target === "cloudflare" ? "Cloudflare Worker" : spec.target === "systemd" ? "systemd timer + service" : "crontab line";
+  const when = spec.target === "systemd" ? `OnCalendar=${spec.tick.onCalendar}` : `${spec.tick.cron} UTC`;
+  const L: string[] = [];
+  L.push(`${c("bold", "cronlag worker")}  ${spec.repo} ${c("dim", "→")} ${what}`);
+  L.push(c("dim", `  every ${spec.tick.label} (${when}) · grace ${fmtDur(spec.graceMs)} · latest due slot, once`));
+  L.push("");
+  const w = Math.max(...spec.workflows.map((x) => x.file.length));
+  const cw = Math.max(...spec.workflows.map((x) => x.schedules.map((s) => s.cron).join(" · ").length));
+  for (const x of spec.workflows) {
+    const guard = x.guarded ? c("green", "guard ✓") : c("yellow", "no guard");
+    L.push(`  ${x.file.padEnd(w)}  ${c("cyan", x.schedules.map((s) => s.cron).join(" · ").padEnd(cw))}  ${guard}`);
+  }
+  const ns = notes(spec, sel);
+  if (ns.length) {
+    L.push("");
+    for (const n of ns) {
+      wrap(n.text, width - 4).forEach((ln, i) => L.push(`  ${i ? " " : n.level === "warn" ? c("yellow", "!") : c("dim", "·")} ${n.level === "info" ? c("dim", ln) : ln}`));
+    }
+  }
+  L.push("");
+  if (o.wrote) {
+    for (const p of o.wrote) L.push(`  ${c("green", "wrote")} ${p}`);
+    L.push("");
+  }
+  const steps: string[] = [];
+  const name = slug(spec.repo);
+  const cd = o.outDir && o.outDir !== "." ? `cd ${o.outDir} && ` : "";
+  if (spec.target === "cloudflare") {
+    if (!o.wrote) steps.push("save it as worker.js (-o <dir> also writes wrangler.toml)");
+    steps.push(`${cd}wrangler secret put GITHUB_TOKEN && wrangler deploy`);
+    steps.push(c("dim", "# token: fine-grained, this repo only, Actions read and write"));
+  } else if (spec.target === "systemd") {
+    steps.push(o.wrote ? `sudo cp ${o.outDir}/${name}.{service,timer} /etc/systemd/system/` : "-o <dir> writes both unit files; copy them to /etc/systemd/system/");
+    steps.push(`put GITHUB_TOKEN=… in /etc/cronlag/${name}.env ${c("dim", "(root only, chmod 600)")}`);
+    steps.push(`sudo systemctl daemon-reload && sudo systemctl enable --now ${name}.timer`);
+  } else {
+    steps.push(`put \`export GITHUB_TOKEN=…\` in ~/.config/cronlag/${name}.env ${c("dim", "(chmod 600)")}`);
+    steps.push(`crontab -e and paste the lines${o.wrote ? ` from ${o.wrote[0]}` : ""}`);
+  }
+  steps.forEach((st, i) => L.push(`  ${i ? "     " : c("bold", "next:")} ${st}`));
+  return L.join("\n");
 }
 
 /** True when this file is the process entry point. npm/npx install the bin as a symlink, so compare real paths. */

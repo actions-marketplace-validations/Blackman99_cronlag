@@ -359,7 +359,7 @@ export function analyzeWorkflow(w: WorkflowInput, snap: Snapshot, t: Thresholds 
       message:
         `Lag is measured from the cron slot to run creation, before any runner is involved — that part is GitHub's scheduler, not your jobs.` +
         (dq !== null && w.dispatchRuns.length ? ` Manual runs of this workflow start ${dq < 60_000 ? "within seconds of" : fmtDur(dq) + " after"} creation (n=${w.dispatchRuns.length}), so runners are fine.` : ""),
-      fix: w.hasDispatch ? `run \`cronlag catchup ${snap.repo.fullName} --dispatch\` from an external cron every 10–15 min` : undefined,
+      fix: w.hasDispatch ? `catch up from outside GitHub: \`cronlag worker ${snap.repo.fullName}\`` : undefined,
     });
   }
   if (stats.queueMedian !== null && stats.queueMedian > 5 * MIN) {

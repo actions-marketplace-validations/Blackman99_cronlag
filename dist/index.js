@@ -8082,7 +8082,7 @@ function analyzeWorkflow(w, snap, t = DEFAULTS) {
       level: "info",
       code: "scheduler-side",
       message: `Lag is measured from the cron slot to run creation, before any runner is involved \u2014 that part is GitHub's scheduler, not your jobs.` + (dq !== null && w.dispatchRuns.length ? ` Manual runs of this workflow start ${dq < 6e4 ? "within seconds of" : fmtDur(dq) + " after"} creation (n=${w.dispatchRuns.length}), so runners are fine.` : ""),
-      fix: w.hasDispatch ? `run \`cronlag catchup ${snap.repo.fullName} --dispatch\` from an external cron every 10\u201315 min` : void 0
+      fix: w.hasDispatch ? `catch up from outside GitHub: \`cronlag worker ${snap.repo.fullName}\`` : void 0
     });
   }
   if (stats.queueMedian !== null && stats.queueMedian > 5 * MIN) {
@@ -8466,6 +8466,7 @@ function formatCatchup(steps, dispatched, color) {
   const c = (k, s) => color ? C[k] + s + C.reset : s;
   if (!steps.length) return "No scheduled workflows.";
   return steps.map((s) => {
+    if (s.error) return `${c("red", "FAILED    ")} ${s.file.padEnd(24)} ${s.reason} \u2014 dispatch failed: ${s.error}`;
     const tag = s.action === "dispatch" ? c("yellow", dispatched ? "DISPATCHED" : "WOULD RUN ") : s.action === "covered" ? c("green", "COVERED   ") : c("dim", "SKIP      ");
     return `${tag} ${s.file.padEnd(24)} ${s.reason}`;
   }).join("\n");

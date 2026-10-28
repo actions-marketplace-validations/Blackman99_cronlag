@@ -20,7 +20,7 @@ npm install -g ./cronlag-0.1.0.tgz             # from the release tarball</code>
 <table><tr><th>What</th><th>Needs</th></tr>
 <tr><td>Report on a public repo</td><td>nothing (60 API calls/hour unauthenticated; a 7-day report uses about 2 + 3 per scheduled workflow; a first <code>--since 90d</code> on an hourly workflow about 25 more, a repeat one almost none)</td></tr>
 <tr><td>Report on a private repo</td><td>fine-grained token with <b>Actions: read</b> and <b>Contents: read</b>, or classic <code>repo</code></td></tr>
-<tr><td><code>catchup --dispatch</code></td><td><b>Actions: write</b></td></tr>
+<tr><td><code>catchup --dispatch</code>, <code>worker</code> schedulers</td><td><b>Actions: read and write</b></td></tr>
 <tr><td>GitHub Action</td><td>the job's <code>GITHUB_TOKEN</code> with <code>actions: read</code> (default for most repos)</td></tr></table></main>
 <footer class="dfoot"><a href="https://github.com/Blackman99/cronlag">GitHub</a> · <a href="https://github.com/Blackman99/cronlag/issues">Issues</a> · MIT</footer>
 </body></html>

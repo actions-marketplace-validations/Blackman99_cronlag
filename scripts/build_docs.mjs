@@ -38,7 +38,7 @@ npm install -g ./cronlag-0.1.0.tgz             # from the release tarball</code>
 <table><tr><th>What</th><th>Needs</th></tr>
 <tr><td>Report on a public repo</td><td>nothing (60 API calls/hour unauthenticated; a 7-day report uses about 2 + 3 per scheduled workflow; a first <code>--since 90d</code> on an hourly workflow about 25 more, a repeat one almost none)</td></tr>
 <tr><td>Report on a private repo</td><td>fine-grained token with <b>Actions: read</b> and <b>Contents: read</b>, or classic <code>repo</code></td></tr>
-<tr><td><code>catchup --dispatch</code></td><td><b>Actions: write</b></td></tr>
+<tr><td><code>catchup --dispatch</code>, <code>worker</code> schedulers</td><td><b>Actions: read and write</b></td></tr>
 <tr><td>GitHub Action</td><td>the job's <code>GITHUB_TOKEN</code> with <code>actions: read</code> (default for most repos)</td></tr></table>`,
 usage: `
 <h2 id="report">Report</h2>
@@ -67,10 +67,19 @@ cronlag org my-org --since 2026-09-01 -f markdown</code></pre>
 <h2 id="catchup">Catch-up</h2>
 <pre><code>cronlag catchup owner/repo              # dry run: what would be dispatched
 cronlag catchup owner/repo --dispatch   # do it</code></pre>
-<p>For each scheduled workflow, cronlag takes the latest slot older than the grace period (<code>--grace</code>, default 15m) and younger than 24h. If neither a scheduled run nor a <code>workflow_dispatch</code> run was created after it, <code>--dispatch</code> starts the workflow on the default branch. Running it again does nothing until the next slot is due, so call it every 10–15 minutes from a scheduler that isn't GitHub's:</p>
-<pre><code># crontab on any server
-*/10 * * * *  GITHUB_TOKEN=github_pat_… npx -y github:Blackman99/cronlag catchup you/repo --dispatch >> ~/cronlag.log 2>&1</code></pre>
+<p>For each scheduled workflow, cronlag takes the latest slot older than the grace period (<code>--grace</code>, default 15m) and younger than 24h. If neither a scheduled run nor a <code>workflow_dispatch</code> run was created after it, <code>--dispatch</code> starts the workflow on the default branch. Running it again does nothing until the next slot is due, so call it every 10–15 minutes from a scheduler that isn't GitHub's: <a href="#worker"><code>cronlag worker</code></a> prints one ready to install. If one dispatch fails (say, a token without Actions: write), the others still go out and the command exits 3.</p>
 <p>The workflow must have a <code>workflow_dispatch:</code> trigger.</p>
+<h2 id="worker">cronlag worker: a scheduler that isn't GitHub's</h2>
+<pre><code>cronlag worker owner/repo -o cronlag-cf                  # Cloudflare Worker: worker.js + wrangler.toml
+cronlag worker owner/repo -t systemd -o units            # systemd .service + .timer
+cronlag worker owner/repo -t crontab                     # one crontab line
+cronlag worker owner/repo -w nightly.yml --every 15m --grace 20m</code></pre>
+<p>It reads the repo's workflows once, keeps the scheduled ones that have <code>workflow_dispatch</code> (or the ones you name with <code>-w</code>), and prints a scheduler that runs exactly one <code>cronlag catchup --dispatch</code> pass every <code>--every</code> (default 10m, at minute 4 and every 10 after, off GitHub's busy :00). Same rules as above: only the latest slot past <code>--grace</code>, once, never inside the grace period. Without <code>-o</code> the file goes to stdout and a summary to stderr; <code>-o &lt;dir&gt;</code> writes the files. The token never goes into the output: it comes from a Worker secret, a root-only <code>EnvironmentFile</code>, or a <code>chmod 600</code> env file. Use a fine-grained token for that one repo with <b>Actions: read and write</b>.</p>
+<table><tr><th>Target</th><th>What you get</th><th>Install</th></tr>
+<tr><td><code>cloudflare</code> (default)</td><td><code>worker.js</code>: a short readable handler on top of cronlag's own catch-up code, bundled (no dependencies, no build step), plus <code>wrangler.toml</code> with the cron trigger</td><td><code>wrangler secret put GITHUB_TOKEN</code>, <code>wrangler deploy</code>. Deploy once with <code>DRY_RUN = "1"</code> and watch <code>wrangler tail</code>. A pass costs about 2 + 3 API calls per workflow, so the free plan's 50 subrequests cover about 15 workflows</td></tr>
+<tr><td><code>systemd</code></td><td><code>&lt;name&gt;.service</code> (oneshot, <code>DynamicUser</code>, sandboxed, token from <code>/etc/cronlag/&lt;name&gt;.env</code>) and <code>&lt;name&gt;.timer</code> (<code>OnCalendar</code> in UTC, <code>Persistent=true</code>)</td><td>copy to <code>/etc/systemd/system/</code>, <code>systemctl enable --now &lt;name&gt;.timer</code></td></tr>
+<tr><td><code>crontab</code></td><td>a <code>PATH</code> line and one entry that sources <code>~/.config/cronlag/&lt;name&gt;.env</code> and appends to <code>~/cronlag-catchup.log</code></td><td><code>crontab -e</code></td></tr></table>
+<p>The workflow list is written into the output, so a workflow you add later is never dispatched by surprise: re-run <code>cronlag worker</code> when you add one or change a cron line. The summary warns about workflows that lack the <a href="#guard">guard</a> step (pair them, or GitHub's late run of a caught-up slot runs too), are disabled, or fire more often than <code>--every</code>. systemd and crontab call <code>npx -y github:Blackman99/cronlag#v0</code>; pass <code>--bin cronlag</code> (or a full path) after a global install. Use <code>-f json</code> to get the schedule and file contents for your own tooling.</p>
 <h2 id="guard">Guard: no double runs</h2>
 <p>When GitHub's late scheduled run finally arrives after catch-up already ran that slot, the guard tells it to skip:</p>
 <pre><code>jobs:
@@ -128,6 +137,10 @@ configuration: `
 <tr><td><code>--lite</code></td><td>off</td><td>skip the workflow-file history lookup (fewer API calls; cron changes in the window are then not detected)</td></tr>
 <tr><td><code>--grace</code></td><td>15m</td><td>catchup: how long after a slot before it counts as missed</td></tr>
 <tr><td><code>--dispatch</code></td><td>off</td><td>catchup: actually dispatch</td></tr>
+<tr><td><code>-t, --target</code></td><td>cloudflare</td><td>worker: <code>cloudflare</code>, <code>systemd</code> or <code>crontab</code></td></tr>
+<tr><td><code>--every</code></td><td>10m</td><td>worker: how often the catch-up pass runs; 5m–1h dividing an hour, or 2h/3h/4h/6h/12h</td></tr>
+<tr><td><code>-o, --out</code></td><td>stdout</td><td>worker: write the files into this directory</td></tr>
+<tr><td><code>--bin</code></td><td>npx</td><td>worker (systemd, crontab): the command that runs cronlag</td></tr>
 <tr><td><code>--tz</code>, <code>-n</code></td><td>UTC, 5</td><td>explain: timezone and number of fire times</td></tr>
 <tr><td><code>--token</code></td><td>env / gh</td><td>GitHub token</td></tr>
 <tr><td><code>--no-color</code></td><td>auto</td><td>plain output (<code>NO_COLOR</code> and <code>FORCE_COLOR</code> are honored)</td></tr></table>
@@ -182,7 +195,7 @@ reference: `
   "unscheduled": [ "ci.yml", … ] }</code></pre>
 <p>Times are epoch milliseconds in <code>slots</code>, ISO strings at the top level. Durations are milliseconds.</p>
 <h2>Exit codes</h2>
-<p><code>0</code> ok (or nothing matched <code>--fail-on</code>) · <code>1</code> a workflow matched <code>--fail-on</code> · <code>2</code> usage error (an unknown option, a bad <code>--since</code> / <code>--days</code>) / invalid cron · <code>3</code> GitHub API error (rate limit, not found, auth).</p>
+<p><code>0</code> ok (or nothing matched <code>--fail-on</code>) · <code>1</code> a workflow matched <code>--fail-on</code> · <code>2</code> usage error (an unknown option, a bad <code>--since</code> / <code>--days</code>) / invalid cron · <code>3</code> GitHub API error (rate limit, not found, auth), or a <code>catchup --dispatch</code> dispatch that failed.</p>
 <h2>MCP tools</h2>
 <p><code>schedule_report</code> returns the Markdown report plus compact JSON; <code>catchup_plan</code> returns the steps <code>catchup</code> would take (never dispatches); <code>cron_explain</code> returns next fire times, shortest interval and the minute-0 flag. All are annotated <code>readOnlyHint: true</code>.</p>`,
 faq: `
@@ -191,7 +204,7 @@ faq: `
 <h2>How exact is the lag?</h2>
 <p>The API doesn't say which cron slot a run belongs to. cronlag ties each run to the closest preceding unclaimed slot. For daily or few-times-a-day schedules that is exact in practice. For schedules more frequent than the delay (say hourly with 3-hour lag) a run may be tied to a later slot than it really served, so the lag is a <b>lower bound</b> and the missed count an upper bound. <code>mode: guard</code> reports the precise lag of the run it is in.</p>
 <h2>Will catch-up cause double runs?</h2>
-<p>Catch-up only dispatches a slot that has no run after the grace period, and never the same slot twice. If GitHub's delayed run arrives later anyway, add the guard job and it will skip. Without the guard, make the job idempotent (most refresh jobs already are) or use a <code>concurrency</code> group.</p>
+<p>Catch-up (and every <code>cronlag worker</code> scheduler) only dispatches a slot that has no run after the grace period, and never the same slot twice. If GitHub's delayed run arrives later anyway, add the guard job and it will skip. Without the guard, make the job idempotent (most refresh jobs already are) or use a <code>concurrency</code> group.</p>
 <h2>Does moving off minute 0 help?</h2>
 <p>Sometimes. GitHub recommends it, and cronlag suggests a quieter minute. But the 2026 threads show off-peak schedules (:15, :23, :38, :47) failing too, so measure before and after with <code>cronlag --since</code> the day you moved it.</p>
 <h2>Private repos? GitHub Enterprise?</h2>

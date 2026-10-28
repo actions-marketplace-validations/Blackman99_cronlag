@@ -175,11 +175,12 @@ export function formatMarkdown(r: Report): string {
   return out.join("\n");
 }
 
-export function formatCatchup(steps: CatchupStep[], dispatched: boolean, color: boolean): string {
+export function formatCatchup(steps: (CatchupStep & { error?: string })[], dispatched: boolean, color: boolean): string {
   const c = (k: keyof typeof C, s: string) => (color ? C[k] + s + C.reset : s);
   if (!steps.length) return "No scheduled workflows.";
   return steps
     .map((s) => {
+      if (s.error) return `${c("red", "FAILED    ")} ${s.file.padEnd(24)} ${s.reason} — dispatch failed: ${s.error}`;
       const tag = s.action === "dispatch" ? c("yellow", dispatched ? "DISPATCHED" : "WOULD RUN ") : s.action === "covered" ? c("green", "COVERED   ") : c("dim", "SKIP      ");
       return `${tag} ${s.file.padEnd(24)} ${s.reason}`;
     })

@@ -24,7 +24,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test test/cron.test.ts test/workflow.test.ts test/analyze.test.ts test/cli.test.ts test/org.test.ts test/window.test.ts",
+    "test": "node --import tsx --test test/cron.test.ts test/workflow.test.ts test/analyze.test.ts test/cli.test.ts test/org.test.ts test/window.test.ts test/worker.test.ts",
     "docs": "node scripts/build_docs.mjs && node scripts/build_blog.mjs"
   },
   "keywords": [

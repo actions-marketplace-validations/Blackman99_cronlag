@@ -134,13 +134,13 @@
 reverify.yml  "Daily rolling re-verification"  <i class="c">0 6 * * *</i>
   <i class="v">▆▆▆▆▆▇▆</i>
   7 slots · 7 ran · 0 missed   on time 0/7 · within 1h 0/7
-  lag  min 4h10 · median <b>4h52</b> · p90 5h35 · max 6h09
-  <i class="l"><b>LATE</b></i>       median run is created 4h52 after its cron slot
+  lag  min 4h18 · median <b>5h10</b> · p90 5h52 · max 6h16
+  <i class="l"><b>LATE</b></i>       median run is created 5h10 after its cron slot
   <i class="l">!</i> "0 6 * * *" fires at minute 0, GitHub's busiest minute (its docs recommend another one).
     → cron: '37 6 * * *'
   <i class="d">· Lag is measured from the cron slot to run creation, before any runner is involved —
     that part is GitHub's scheduler, not your jobs.</i>
-    → run `cronlag catchup robhunter/agentdeals --dispatch` from an external cron every 10–15 min</code></pre>
+    → catch up from outside GitHub: `cronlag worker robhunter/agentdeals`</code></pre>
     <p>No token needed for public repos (60 API calls an hour); with <code>gh auth login</code> or <code>GITHUB_TOKEN</code> it reads private ones too. <code>--format markdown</code> pastes straight into the issue you were about to write by hand.</p>
     <p>To see when it started, look further back: <code>--since 2026-08-15</code> shows this job created within the hour every morning until 26 August, then 4 to 12 hours late every day from the 27th on. Windows go up to 400 days, and finished days are cached on disk, so asking again tomorrow only fetches tomorrow.</p>
   </section>
@@ -160,8 +160,9 @@ reverify.yml  "Daily rolling re-verification"  <i class="c">0 6 * * *</i>
 
   <section class="link r" id="catchup">
     <h2>Make the bird sing anyway</h2>
-    <p><code>cronlag catchup</code> looks at each schedule's latest due slot. If it has no run after a grace period, <code>--dispatch</code> starts it through <code>workflow_dispatch</code>. Run it every 10–15 minutes from any cron that isn't GitHub's — a server, a Cloudflare Worker, a Raspberry Pi. Slots that already ran are left alone, so it never doubles up.</p>
-<pre class="cmd"><code>*/10 * * * *  GITHUB_TOKEN=… npx -y github:Blackman99/cronlag catchup you/repo --dispatch</code></pre>
+    <p><code>cronlag catchup</code> looks at each schedule's latest due slot. If it has no run after a grace period, <code>--dispatch</code> starts it through <code>workflow_dispatch</code>. Run it every 10 minutes from any cron that isn't GitHub's. Slots that already ran are left alone, so it never doubles up. <code>cronlag worker</code> writes that cron for you: a Cloudflare Worker with a cron trigger, a systemd timer (<code>-t systemd</code>) or a crontab line (<code>-t crontab</code>), with the token kept in a secret, never in the file.</p>
+<pre class="cmd"><code>npx github:Blackman99/cronlag worker you/repo -o cronlag-cf   # worker.js + wrangler.toml
+cd cronlag-cf && wrangler secret put GITHUB_TOKEN && wrangler deploy</code></pre>
     <p>And when the late scheduled run finally turns up, <code>mode: guard</code> tells it to stand down:</p>
 <pre class="yaml"><code>jobs:
   guard:
